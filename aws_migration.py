@@ -968,12 +968,54 @@ class AWSMigrationOrchestrator:
         print(f"\n📦 Step 2: Handling AMI...")
         ami_id = instance_info['ami_id']
         
+        # Check if AMI has encrypted snapshots and grant KMS access
+        if not dry_run:
+            try:
+                ami_details = self.source_ec2.describe_images(ImageIds=[ami_id])['Images'][0]
+                encrypted_snapshot_keys = set()
+                
+                for bdm in ami_details.get('BlockDeviceMappings', []):
+                    if 'Ebs' in bdm and bdm['Ebs'].get('Encrypted'):
+                        snapshot_id = bdm['Ebs'].get('SnapshotId')
+                        if snapshot_id:
+                            # Get snapshot KMS key
+                            try:
+                                snapshot_info = self.source_ec2.describe_snapshots(SnapshotIds=[snapshot_id])['Snapshots'][0]
+                                kms_key_id = snapshot_info.get('KmsKeyId')
+                                if kms_key_id and not '/aws/' in kms_key_id:
+                                    encrypted_snapshot_keys.add(kms_key_id)
+                            except Exception as e:
+                                print(f"   ⚠️  Warning: Could not get snapshot {snapshot_id} details: {str(e)}")
+                
+                # Grant KMS access for AMI snapshots
+                if encrypted_snapshot_keys:
+                    print(f"\n🔑 Step 2a: Granting KMS access for AMI snapshots...")
+                    for kms_key_id in encrypted_snapshot_keys:
+                        try:
+                            grant_response = self.source_kms.create_grant(
+                                KeyId=kms_key_id,
+                                GranteePrincipal=f"arn:aws:iam::{self.target_account_id}:root",
+                                Operations=[
+                                    'Decrypt',
+                                    'DescribeKey',
+                                    'CreateGrant'
+                                ]
+                            )
+                            print(f"   ✅ KMS grant created for key {kms_key_id}: {grant_response['GrantId']}")
+                        except Exception as e:
+                            print(f"   ⚠️  Warning: Could not create KMS grant for {kms_key_id}: {str(e)}")
+            except Exception as e:
+                print(f"   ⚠️  Warning: Could not check AMI encryption: {str(e)}")
+        
         if dry_run:
+            print(f"   [DRY RUN] Would check AMI for encrypted snapshots")
+            print(f"   [DRY RUN] Would grant KMS access if needed")
             print(f"   [DRY RUN] Would share AMI {ami_id} with target account")
             print(f"   [DRY RUN] Would copy AMI to target account")
         else:
             try:
                 # Share AMI
+                print(f"\n📦 Step 2b: Sharing and copying AMI...")
                 print(f"   Sharing AMI {ami_id} with target account...")
                 self.source_ec2.modify_image_attribute(
                     ImageId=ami_id,
@@ -1005,7 +1047,55 @@ class AWSMigrationOrchestrator:
         # Step 3: Handle volumes/snapshots
         print(f"\n💾 Step 3: Creating volume snapshots...")
         snapshot_mapping = {}
+        encrypted_volumes_kms = {}
         
+        # First, check which volumes are encrypted and grant KMS access
+        for volume_info in instance_info['block_device_mappings']:
+            if 'Ebs' in volume_info:
+                volume_id = volume_info['Ebs']['VolumeId']
+                
+                try:
+                    volume_details = self._get_volume_details(volume_id)
+                    if volume_details['encrypted'] and volume_details.get('kms_key_id'):
+                        encrypted_volumes_kms[volume_id] = volume_details['kms_key_id']
+                except Exception as e:
+                    print(f"   ⚠️  Warning: Could not get volume details for {volume_id}: {str(e)}")
+        
+        # Grant KMS access for encrypted volumes
+        if encrypted_volumes_kms:
+            print(f"\n🔑 Step 3a: Granting KMS access for encrypted volumes...")
+            granted_keys = set()
+            
+            for volume_id, kms_key_id in encrypted_volumes_kms.items():
+                # Skip if we already granted access for this key
+                if kms_key_id in granted_keys:
+                    continue
+                
+                # Skip AWS-managed keys
+                if kms_key_id.startswith('arn:aws:kms:') and '/aws/' in kms_key_id:
+                    print(f"   ℹ️  Volume {volume_id} uses AWS-managed key, skipping grant")
+                    continue
+                
+                if dry_run:
+                    print(f"   [DRY RUN] Would create KMS grant for key {kms_key_id}")
+                else:
+                    try:
+                        grant_response = self.source_kms.create_grant(
+                            KeyId=kms_key_id,
+                            GranteePrincipal=f"arn:aws:iam::{self.target_account_id}:root",
+                            Operations=[
+                                'Decrypt',
+                                'DescribeKey',
+                                'CreateGrant'
+                            ]
+                        )
+                        print(f"   ✅ KMS grant created for key {kms_key_id}: {grant_response['GrantId']}")
+                        granted_keys.add(kms_key_id)
+                    except Exception as e:
+                        print(f"   ⚠️  Warning: Could not create KMS grant for {kms_key_id}: {str(e)}")
+        
+        # Now create snapshots
+        print(f"\n💾 Step 3b: Creating snapshots...")
         for volume_info in instance_info['block_device_mappings']:
             if 'Ebs' in volume_info:
                 volume_id = volume_info['Ebs']['VolumeId']
@@ -1260,6 +1350,31 @@ class AWSMigrationOrchestrator:
                         print(f"   You must specify --target-kms-key with an existing key in target account")
                         print(f"   Or create a new key first")
                         return
+            
+            # Grant KMS key access to target account for snapshot copying
+            if db_info['kms_key_id'] and not db_info['kms_key_details'].get('is_aws_managed'):
+                print(f"\n🔑 Step 2b: Granting KMS key access to target account...")
+                
+                if dry_run:
+                    print(f"   [DRY RUN] Would create KMS grant for target account {self.target_account_id}")
+                    print(f"   [DRY RUN] This allows target account to decrypt the snapshot")
+                else:
+                    try:
+                        # Create a grant that allows the target account to use the key
+                        grant_response = self.source_kms.create_grant(
+                            KeyId=db_info['kms_key_id'],
+                            GranteePrincipal=f"arn:aws:iam::{self.target_account_id}:root",
+                            Operations=[
+                                'Decrypt',
+                                'DescribeKey',
+                                'CreateGrant'
+                            ]
+                        )
+                        print(f"   ✅ KMS grant created: {grant_response['GrantId']}")
+                        print(f"   ℹ️  Target account can now decrypt snapshots encrypted with this key")
+                    except Exception as e:
+                        print(f"   ⚠️  Warning: Could not create KMS grant: {str(e)}")
+                        print(f"   ℹ️  You may need to manually grant access or update key policy")
         
         # Step 3: Create snapshot
         print(f"\n💾 Step 3: Creating RDS snapshot...")
