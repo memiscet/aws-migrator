@@ -1363,32 +1363,47 @@ class AWSMigrationOrchestrator:
             }
             
             try:
-                # Create VPC
-                print("\n[Creating VPC...]")
-                target_vpc = self.target_ec2.create_vpc(CidrBlock=vpc_cidr)
-                target_vpc_id = target_vpc['Vpc']['VpcId']
-                migration_result['target_vpc_id'] = target_vpc_id
-                print(f"   ✅ Created VPC: {target_vpc_id}")
+                # Check for existing VPC with same CIDR
+                print("\n[Checking for existing VPC...]")
+                existing_vpcs = self.target_ec2.describe_vpcs(
+                    Filters=[{'Name': 'cidr', 'Values': [vpc_cidr]}]
+                )['Vpcs']
                 
-                # Tag VPC
-                self.target_ec2.create_tags(
-                    Resources=[target_vpc_id],
-                    Tags=[{'Key': 'Name', 'Value': f"{vpc_name}-migrated"}] + 
-                         [tag for tag in source_vpc.get('Tags', []) if tag['Key'] != 'Name']
-                )
+                if existing_vpcs:
+                    target_vpc_id = existing_vpcs[0]['VpcId']
+                    existing_vpc_name = next((tag['Value'] for tag in existing_vpcs[0].get('Tags', []) if tag['Key'] == 'Name'), 'UnnamedVPC')
+                    migration_result['target_vpc_id'] = target_vpc_id
+                    migration_result['vpc_reused'] = True
+                    print(f"   ✅ Found existing VPC with matching CIDR {vpc_cidr}: {target_vpc_id} ({existing_vpc_name})")
+                    print(f"   ℹ️  Reusing existing VPC instead of creating new one")
+                else:
+                    # Create VPC
+                    print(f"   ℹ️  No existing VPC found with CIDR {vpc_cidr}, creating new VPC...")
+                    target_vpc = self.target_ec2.create_vpc(CidrBlock=vpc_cidr)
+                    target_vpc_id = target_vpc['Vpc']['VpcId']
+                    migration_result['target_vpc_id'] = target_vpc_id
+                    migration_result['vpc_reused'] = False
+                    print(f"   ✅ Created VPC: {target_vpc_id}")
+                    
+                    # Tag VPC
+                    self.target_ec2.create_tags(
+                        Resources=[target_vpc_id],
+                        Tags=[{'Key': 'Name', 'Value': f"{vpc_name}-migrated"}] + 
+                             [tag for tag in source_vpc.get('Tags', []) if tag['Key'] != 'Name']
+                    )
+                    
+                    # Enable DNS attributes
+                    if dns_support:
+                        self.target_ec2.modify_vpc_attribute(VpcId=target_vpc_id, EnableDnsSupport={'Value': True})
+                    if dns_hostnames:
+                        self.target_ec2.modify_vpc_attribute(VpcId=target_vpc_id, EnableDnsHostnames={'Value': True})
+                    
+                    # Wait for VPC to be available
+                    print("   ⏳ Waiting for VPC to be available...")
+                    time.sleep(5)
                 
-                # Enable DNS attributes
-                if dns_support:
-                    self.target_ec2.modify_vpc_attribute(VpcId=target_vpc_id, EnableDnsSupport={'Value': True})
-                if dns_hostnames:
-                    self.target_ec2.modify_vpc_attribute(VpcId=target_vpc_id, EnableDnsHostnames={'Value': True})
-                
-                # Wait for VPC to be available
-                print("   ⏳ Waiting for VPC to be available...")
-                time.sleep(5)
-                
-                # Create subnets
-                print(f"\n[Creating {len(subnets)} subnets...]")
+                # Create or reuse subnets
+                print(f"\n[Processing {len(subnets)} subnets...]")
                 for source_subnet_id, subnet_info in subnet_mapping.items():
                     try:
                         # Map AZ (might need adjustment for cross-region)
@@ -1398,20 +1413,37 @@ class AWSMigrationOrchestrator:
                             az_suffix = subnet_info['az'][-1]
                             target_az = f"{self.target_session.region_name}{az_suffix}"
                         
-                        target_subnet = self.target_ec2.create_subnet(
-                            VpcId=target_vpc_id,
-                            CidrBlock=subnet_info['cidr'],
-                            AvailabilityZone=target_az
-                        )
-                        target_subnet_id = target_subnet['Subnet']['SubnetId']
-                        migration_result['subnet_mapping'][source_subnet_id] = target_subnet_id
+                        # Check for existing subnet with same CIDR in the target VPC
+                        existing_subnets = self.target_ec2.describe_subnets(
+                            Filters=[
+                                {'Name': 'vpc-id', 'Values': [target_vpc_id]},
+                                {'Name': 'cidr-block', 'Values': [subnet_info['cidr']]}
+                            ]
+                        )['Subnets']
                         
-                        # Tag subnet
-                        self.target_ec2.create_tags(
-                            Resources=[target_subnet_id],
-                            Tags=[{'Key': 'Name', 'Value': f"{subnet_info['name']}-migrated"}] + 
-                                 [tag for tag in subnet_info['tags'] if tag['Key'] != 'Name']
-                        )
+                        if existing_subnets:
+                            target_subnet_id = existing_subnets[0]['SubnetId']
+                            migration_result['subnet_mapping'][source_subnet_id] = target_subnet_id
+                            existing_subnet_name = next((tag['Value'] for tag in existing_subnets[0].get('Tags', []) if tag['Key'] == 'Name'), target_subnet_id)
+                            print(f"   ✅ Reusing existing subnet: {subnet_info['name']} → {target_subnet_id} ({existing_subnet_name})")
+                        else:
+                            # Create new subnet
+                            target_subnet = self.target_ec2.create_subnet(
+                                VpcId=target_vpc_id,
+                                CidrBlock=subnet_info['cidr'],
+                                AvailabilityZone=target_az
+                            )
+                            target_subnet_id = target_subnet['Subnet']['SubnetId']
+                            migration_result['subnet_mapping'][source_subnet_id] = target_subnet_id
+                            
+                            # Tag subnet
+                            self.target_ec2.create_tags(
+                                Resources=[target_subnet_id],
+                                Tags=[{'Key': 'Name', 'Value': f"{subnet_info['name']}-migrated"}] + 
+                                     [tag for tag in subnet_info['tags'] if tag['Key'] != 'Name']
+                            )
+                            
+                            print(f"   ✅ Created subnet: {subnet_info['name']} → {target_subnet_id}")
                         
                         # Set map public IP if needed
                         if subnet_info['map_public_ip']:
@@ -1424,43 +1456,68 @@ class AWSMigrationOrchestrator:
                     except Exception as e:
                         print(f"   ⚠️  Error creating subnet {subnet_info['name']}: {str(e)}")
                 
-                # Create Internet Gateway
+                # Create or reuse Internet Gateway
                 if has_igw:
-                    print("\n[Creating Internet Gateway...]")
+                    print("\n[Processing Internet Gateway...]")
                     try:
-                        target_igw = self.target_ec2.create_internet_gateway()
-                        target_igw_id = target_igw['InternetGateway']['InternetGatewayId']
-                        self.target_ec2.attach_internet_gateway(
-                            InternetGatewayId=target_igw_id,
-                            VpcId=target_vpc_id
-                        )
-                        migration_result['igw_id'] = target_igw_id
-                        print(f"   ✅ Created and attached IGW: {target_igw_id}")
+                        # Check if target VPC already has an Internet Gateway
+                        existing_igws = self.target_ec2.describe_internet_gateways(
+                            Filters=[{'Name': 'attachment.vpc-id', 'Values': [target_vpc_id]}]
+                        )['InternetGateways']
+                        
+                        if existing_igws:
+                            target_igw_id = existing_igws[0]['InternetGatewayId']
+                            migration_result['igw_id'] = target_igw_id
+                            print(f"   ✅ Reusing existing Internet Gateway: {target_igw_id}")
+                        else:
+                            # Create new Internet Gateway
+                            target_igw = self.target_ec2.create_internet_gateway()
+                            target_igw_id = target_igw['InternetGateway']['InternetGatewayId']
+                            self.target_ec2.attach_internet_gateway(
+                                InternetGatewayId=target_igw_id,
+                                VpcId=target_vpc_id
+                            )
+                            migration_result['igw_id'] = target_igw_id
+                            print(f"   ✅ Created and attached IGW: {target_igw_id}")
                     except Exception as e:
-                        print(f"   ⚠️  Error creating IGW: {str(e)}")
+                        print(f"   ⚠️  Error processing IGW: {str(e)}")
                 
-                # Create Security Groups (two-pass: create first, then add rules)
-                print(f"\n[Creating {len(custom_sgs)} security groups...]")
+                # Create or reuse Security Groups (two-pass: create first, then add rules)
+                print(f"\n[Processing {len(custom_sgs)} security groups...]")
                 for source_sg_id, sg_info in sg_mapping.items():
                     try:
-                        target_sg = self.target_ec2.create_security_group(
-                            GroupName=f"{sg_info['name']}-migrated",
-                            Description=sg_info['description'] or 'Migrated security group',
-                            VpcId=target_vpc_id
-                        )
-                        target_sg_id = target_sg['GroupId']
-                        migration_result['sg_mapping'][source_sg_id] = target_sg_id
+                        # Check for existing security group with same name in the target VPC
+                        existing_sgs = self.target_ec2.describe_security_groups(
+                            Filters=[
+                                {'Name': 'vpc-id', 'Values': [target_vpc_id]},
+                                {'Name': 'group-name', 'Values': [sg_info['name'], f"{sg_info['name']}-migrated"]}
+                            ]
+                        )['SecurityGroups']
                         
-                        # Tag security group
-                        if sg_info['tags']:
-                            self.target_ec2.create_tags(
-                                Resources=[target_sg_id],
-                                Tags=sg_info['tags']
+                        if existing_sgs:
+                            target_sg_id = existing_sgs[0]['GroupId']
+                            migration_result['sg_mapping'][source_sg_id] = target_sg_id
+                            print(f"   ✅ Reusing existing security group: {sg_info['name']} → {target_sg_id}")
+                        else:
+                            # Create new security group
+                            target_sg = self.target_ec2.create_security_group(
+                                GroupName=f"{sg_info['name']}-migrated",
+                                Description=sg_info['description'] or 'Migrated security group',
+                                VpcId=target_vpc_id
                             )
-                        
-                        print(f"   ✅ Created security group: {sg_info['name']} → {target_sg_id}")
+                            target_sg_id = target_sg['GroupId']
+                            migration_result['sg_mapping'][source_sg_id] = target_sg_id
+                            
+                            # Tag security group
+                            if sg_info['tags']:
+                                self.target_ec2.create_tags(
+                                    Resources=[target_sg_id],
+                                    Tags=sg_info['tags']
+                                )
+                            
+                            print(f"   ✅ Created security group: {sg_info['name']} → {target_sg_id}")
                     except Exception as e:
-                        print(f"   ⚠️  Error creating SG {sg_info['name']}: {str(e)}")
+                        print(f"   ⚠️  Error processing SG {sg_info['name']}: {str(e)}")
                 
                 # Add security group rules
                 print("\n[Adding security group rules...]")
