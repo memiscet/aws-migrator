@@ -36,6 +36,10 @@ class AWSMigrationOrchestrator:
         self.source_kms = self.source_session.client('kms')
         self.target_kms = self.target_session.client('kms')
         
+        # IAM clients
+        self.source_iam = self.source_session.client('iam')
+        self.target_iam = self.target_session.client('iam')
+        
         # Get account IDs
         self.source_account_id = self.source_session.client('sts').get_caller_identity()['Account']
         self.target_account_id = self.target_session.client('sts').get_caller_identity()['Account']
@@ -67,6 +71,329 @@ class AWSMigrationOrchestrator:
             'key_pairs': [],
             'kms_keys': []
         }
+    
+    def setup_iam_policies(self, dry_run: bool = True):
+        """
+        Create required IAM policies in both source and target accounts
+        
+        Args:
+            dry_run: If True, show what would be created without making changes
+        """
+        print("\n" + "=" * 100)
+        if dry_run:
+            print("🧪 DRY RUN: IAM Policy Setup")
+        else:
+            print("🚀 IAM Policy Setup")
+        print("=" * 100)
+        
+        # Define policy documents
+        policies = {
+            'source': {
+                'name': 'AWSMigrationToolSourcePolicy',
+                'description': 'Policy for AWS Migration Tool in source account',
+                'document': {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "EC2ReadPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:Describe*",
+                                "ec2:CreateImage",
+                                "ec2:CopyImage",
+                                "ec2:CreateSnapshot",
+                                "ec2:CopySnapshot",
+                                "ec2:CreateTags",
+                                "ec2:GetConsoleOutput"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "RDSReadPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "rds:Describe*",
+                                "rds:CreateDBSnapshot",
+                                "rds:CreateDBClusterSnapshot",
+                                "rds:CopyDBSnapshot",
+                                "rds:CopyDBClusterSnapshot",
+                                "rds:ModifyDBSnapshotAttribute",
+                                "rds:ModifyDBClusterSnapshotAttribute",
+                                "rds:ListTagsForResource",
+                                "rds:AddTagsToResource"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "KMSPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "kms:Describe*",
+                                "kms:List*",
+                                "kms:CreateGrant",
+                                "kms:Decrypt",
+                                "kms:DescribeKey",
+                                "kms:GetKeyPolicy"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "IAMReadPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "iam:GetUser",
+                                "iam:GetRole",
+                                "iam:ListAttachedUserPolicies",
+                                "iam:ListAttachedRolePolicies"
+                            ],
+                            "Resource": "*"
+                        }
+                    ]
+                }
+            },
+            'target': {
+                'name': 'AWSMigrationToolTargetPolicy',
+                'description': 'Policy for AWS Migration Tool in target account',
+                'document': {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "VPCFullPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:CreateVpc",
+                                "ec2:DeleteVpc",
+                                "ec2:ModifyVpcAttribute",
+                                "ec2:DescribeVpcs",
+                                "ec2:DescribeVpcAttribute",
+                                "ec2:CreateSubnet",
+                                "ec2:DeleteSubnet",
+                                "ec2:ModifySubnetAttribute",
+                                "ec2:DescribeSubnets",
+                                "ec2:CreateInternetGateway",
+                                "ec2:DeleteInternetGateway",
+                                "ec2:AttachInternetGateway",
+                                "ec2:DetachInternetGateway",
+                                "ec2:DescribeInternetGateways",
+                                "ec2:CreateNatGateway",
+                                "ec2:DeleteNatGateway",
+                                "ec2:DescribeNatGateways",
+                                "ec2:AllocateAddress",
+                                "ec2:ReleaseAddress",
+                                "ec2:AssociateAddress",
+                                "ec2:DisassociateAddress",
+                                "ec2:DescribeAddresses"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "SecurityGroupPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:CreateSecurityGroup",
+                                "ec2:DeleteSecurityGroup",
+                                "ec2:DescribeSecurityGroups",
+                                "ec2:AuthorizeSecurityGroupIngress",
+                                "ec2:AuthorizeSecurityGroupEgress",
+                                "ec2:RevokeSecurityGroupIngress",
+                                "ec2:RevokeSecurityGroupEgress",
+                                "ec2:UpdateSecurityGroupRuleDescriptionsIngress",
+                                "ec2:UpdateSecurityGroupRuleDescriptionsEgress"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "RouteTablePermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:CreateRouteTable",
+                                "ec2:DeleteRouteTable",
+                                "ec2:DescribeRouteTables",
+                                "ec2:CreateRoute",
+                                "ec2:DeleteRoute",
+                                "ec2:ReplaceRoute",
+                                "ec2:AssociateRouteTable",
+                                "ec2:DisassociateRouteTable",
+                                "ec2:ReplaceRouteTableAssociation"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "NetworkACLPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:CreateNetworkAcl",
+                                "ec2:DeleteNetworkAcl",
+                                "ec2:DescribeNetworkAcls",
+                                "ec2:CreateNetworkAclEntry",
+                                "ec2:DeleteNetworkAclEntry",
+                                "ec2:ReplaceNetworkAclEntry",
+                                "ec2:ReplaceNetworkAclAssociation"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "EC2InstancePermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:Describe*",
+                                "ec2:RunInstances",
+                                "ec2:StartInstances",
+                                "ec2:StopInstances",
+                                "ec2:TerminateInstances",
+                                "ec2:CreateImage",
+                                "ec2:CopyImage",
+                                "ec2:RegisterImage",
+                                "ec2:DeregisterImage",
+                                "ec2:CreateSnapshot",
+                                "ec2:CopySnapshot",
+                                "ec2:DeleteSnapshot",
+                                "ec2:CreateVolume",
+                                "ec2:DeleteVolume",
+                                "ec2:AttachVolume",
+                                "ec2:DetachVolume",
+                                "ec2:CreateTags",
+                                "ec2:DeleteTags",
+                                "ec2:ImportKeyPair",
+                                "ec2:CreateKeyPair"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "RDSPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "rds:Describe*",
+                                "rds:CopyDBSnapshot",
+                                "rds:CopyDBClusterSnapshot",
+                                "rds:RestoreDBInstanceFromDBSnapshot",
+                                "rds:RestoreDBClusterFromSnapshot",
+                                "rds:CreateDBInstance",
+                                "rds:CreateDBCluster",
+                                "rds:ModifyDBInstance",
+                                "rds:ModifyDBCluster",
+                                "rds:DeleteDBInstance",
+                                "rds:DeleteDBCluster",
+                                "rds:AddTagsToResource",
+                                "rds:ListTagsForResource",
+                                "rds:CreateDBSubnetGroup",
+                                "rds:ModifyDBSubnetGroup"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "KMSPermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "kms:CreateKey",
+                                "kms:CreateAlias",
+                                "kms:DeleteAlias",
+                                "kms:Describe*",
+                                "kms:List*",
+                                "kms:Encrypt",
+                                "kms:Decrypt",
+                                "kms:CreateGrant",
+                                "kms:RetireGrant",
+                                "kms:DescribeKey",
+                                "kms:GetKeyPolicy",
+                                "kms:PutKeyPolicy"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "IAMPassRolePermissions",
+                            "Effect": "Allow",
+                            "Action": [
+                                "iam:PassRole",
+                                "iam:GetRole"
+                            ],
+                            "Resource": "*",
+                            "Condition": {
+                                "StringEquals": {
+                                    "iam:PassedToService": [
+                                        "ec2.amazonaws.com",
+                                        "rds.amazonaws.com"
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+        
+        # Create policies in both accounts
+        for account_type, policy_info in policies.items():
+            iam_client = self.source_iam if account_type == 'source' else self.target_iam
+            account_id = self.source_account_id if account_type == 'source' else self.target_account_id
+            
+            print(f"\n{'=' * 80}")
+            print(f"📋 {account_type.upper()} Account ({account_id})")
+            print(f"{'=' * 80}")
+            
+            if dry_run:
+                print(f"\n[DRY RUN] Would create/update policy: {policy_info['name']}")
+                print(f"   Description: {policy_info['description']}")
+                print(f"   Permissions: {len(policy_info['document']['Statement'])} statement groups")
+                for i, statement in enumerate(policy_info['document']['Statement'], 1):
+                    print(f"      {i}. {statement['Sid']}: {len(statement['Action'])} actions")
+            else:
+                try:
+                    # Check if policy exists
+                    try:
+                        policy_arn = f"arn:aws:iam::{account_id}:policy/{policy_info['name']}"
+                        iam_client.get_policy(PolicyArn=policy_arn)
+                        print(f"   ℹ️  Policy already exists: {policy_info['name']}")
+                        
+                        # Get current version
+                        versions = iam_client.list_policy_versions(PolicyArn=policy_arn)['Versions']
+                        if len(versions) >= 5:
+                            # Delete oldest version if at limit
+                            oldest = sorted(versions, key=lambda x: x['CreateDate'])[0]
+                            if not oldest['IsDefaultVersion']:
+                                iam_client.delete_policy_version(
+                                    PolicyArn=policy_arn,
+                                    VersionId=oldest['VersionId']
+                                )
+                        
+                        # Create new version
+                        iam_client.create_policy_version(
+                            PolicyArn=policy_arn,
+                            PolicyDocument=json.dumps(policy_info['document']),
+                            SetAsDefault=True
+                        )
+                        print(f"   ✅ Updated policy with new version")
+                        
+                    except iam_client.exceptions.NoSuchEntityException:
+                        # Create new policy
+                        response = iam_client.create_policy(
+                            PolicyName=policy_info['name'],
+                            PolicyDocument=json.dumps(policy_info['document']),
+                            Description=policy_info['description']
+                        )
+                        print(f"   ✅ Created policy: {policy_info['name']}")
+                        print(f"      ARN: {response['Policy']['Arn']}")
+                    
+                except Exception as e:
+                    print(f"   ❌ Error creating/updating policy: {str(e)}")
+        
+        print("\n" + "=" * 100)
+        if dry_run:
+            print("📝 Next Steps (after running without --dry-run):")
+        else:
+            print("📝 Next Steps:")
+        print("=" * 100)
+        print("\n1️⃣  Attach policies to IAM users or roles:")
+        print(f"   Source Account:")
+        print(f"      aws iam attach-user-policy --user-name YOUR_USER --policy-arn arn:aws:iam::{self.source_account_id}:policy/AWSMigrationToolSourcePolicy")
+        print(f"   Target Account:")
+        print(f"      aws iam attach-user-policy --user-name YOUR_USER --policy-arn arn:aws:iam::{self.target_account_id}:policy/AWSMigrationToolTargetPolicy")
+        print("\n2️⃣  Or create new users and attach policies:")
+        print(f"   aws iam create-user --user-name migration-tool-user")
+        print(f"   aws iam attach-user-policy --user-name migration-tool-user --policy-arn <POLICY_ARN>")
+        print(f"   aws iam create-access-key --user-name migration-tool-user")
+        print("\n3️⃣  Update your AWS credentials with the new access keys")
+        print("=" * 100)
     
     def generate_complete_migration_report(self, ec2_instance_ids: List[str] = None, 
                                           rds_instance_ids: List[str] = None) -> Dict:
@@ -1702,6 +2029,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Setup IAM policies (dry-run first)
+  python aws_migration.py --setup-policies --dry-run
+
+  # Actually create IAM policies
+  python aws_migration.py --setup-policies
+
   # Generate migration report (dry-run analysis)
   python aws_migration.py --report
 
@@ -1742,6 +2075,8 @@ Examples:
                        help='AWS region for target account (default: us-east-1)')
     
     # Action arguments
+    parser.add_argument('--setup-policies', action='store_true',
+                       help='Setup required IAM policies in both source and target accounts')
     parser.add_argument('--report', action='store_true',
                        help='Generate migration report (analysis only)')
     parser.add_argument('--migrate-ec2', type=str, metavar='INSTANCE_ID',
@@ -1789,7 +2124,12 @@ Examples:
             args.target_region
         )
         
-        if args.report:
+        if args.setup_policies:
+            # Setup IAM policies
+            print("\n🔐 SETTING UP IAM POLICIES...")
+            orchestrator.setup_iam_policies(dry_run=args.dry_run)
+            
+        elif args.report:
             # Report generation mode
             print("\n📊 GENERATING MIGRATION REPORT...")
             orchestrator.generate_complete_migration_report(ec2_instance_ids, rds_instance_ids)

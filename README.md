@@ -64,7 +64,42 @@ Docker-based solution for migrating AWS resources (EC2, RDS, VPC, etc.) between 
    aws ec2 describe-vpcs --profile target_acc
    ```
 
-3. **Required IAM Permissions:**
+3. **Setup IAM Permissions (Automated):**
+   
+   The tool can automatically create required IAM policies in both accounts:
+   
+   ```bash
+   # First, build the Docker image
+   docker build -t aws-migration-tool:latest .
+   
+   # Preview what policies will be created (dry-run)
+   docker run --rm -v ~/.aws:/root/.aws:ro aws-migration-tool:latest \
+     python aws_migration.py --setup-policies --dry-run
+   
+   # Actually create the policies
+   docker run --rm -v ~/.aws:/root/.aws:ro aws-migration-tool:latest \
+     python aws_migration.py --setup-policies
+   ```
+   
+   This creates two managed policies:
+   - **Source Account**: `AWSMigrationToolSourcePolicy` (read/snapshot permissions)
+   - **Target Account**: `AWSMigrationToolTargetPolicy` (full migration permissions)
+   
+   After creation, attach the policies to your IAM users:
+   ```bash
+   # In source account
+   aws iam attach-user-policy --user-name YOUR_USER \
+     --policy-arn arn:aws:iam::SOURCE_ACCOUNT_ID:policy/AWSMigrationToolSourcePolicy
+   
+   # In target account
+   aws iam attach-user-policy --user-name YOUR_USER \
+     --policy-arn arn:aws:iam::TARGET_ACCOUNT_ID:policy/AWSMigrationToolTargetPolicy
+   ```
+   
+   **Or manually set up permissions:**
+   
+   <details>
+   <summary>Click to see manual IAM permissions</summary>
    
    Ensure both profiles have the following permissions:
    
@@ -87,8 +122,10 @@ Docker-based solution for migrating AWS resources (EC2, RDS, VPC, etc.) between 
    **For KMS (if using encryption):**
    - `kms:CreateGrant`, `kms:Decrypt`, `kms:DescribeKey`, `kms:CreateKey`
    - `kms:ListAliases`, `kms:CreateAlias`
+   
+   </details>
 
-4. **Build the Docker image:**
+4. **Build the Docker image (if not done already):**
    ```bash
    docker build -t aws-migration-tool:latest .
    ```
