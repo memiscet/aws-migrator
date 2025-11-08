@@ -111,8 +111,21 @@ if [ "$INSTANCE_COUNT" -eq 1 ]; then
 else
     # Prompt user to select
     read -p "Select RDS instance number to migrate (1-$INSTANCE_COUNT): " selection
-    RDS_INSTANCE=$(echo "$RDS_INSTANCES" | tr ' ' '\n' | sed -n "${selection}p")
+    # Convert RDS_INSTANCES to array and select by index
+    INSTANCES_ARRAY=($RDS_INSTANCES)
+    # Validate selection is a number
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$INSTANCE_COUNT" ]; then
+        print_error "Invalid selection: $selection"
+        exit 1
+    fi
+    RDS_INSTANCE="${INSTANCES_ARRAY[$((selection-1))]}"
     print_success "Selected: $RDS_INSTANCE"
+fi
+
+# Validate selection
+if [ -z "$RDS_INSTANCE" ]; then
+    print_error "Invalid selection"
+    exit 1
 fi
 
 # Get RDS engine for port detection

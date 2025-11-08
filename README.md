@@ -4,12 +4,42 @@ Docker-based solution for migrating AWS resources (EC2, RDS, VPC, etc.) between 
 
 ## 📋 Features
 
-- **EC2 Migration**: Instances, AMIs, EBS volumes, snapshots, user data, SSH keys
-- **RDS Migration**: Database instances, Aurora clusters, with KMS encryption support
-- **Network Migration**: VPCs, subnets, security groups, route tables, NACLs
-- **KMS Handling**: Automatic KMS key recreation and snapshot re-encryption
-- **Elastic IPs**: Automatic allocation in target account
-- **Comprehensive Reporting**: Detailed dry-run analysis before migration
+### ✅ EC2 Instance Migration (NEW!)
+- **Automated Instance Migration**: Complete EC2 instance migration with all configurations
+- **Security Group Dependencies**: Automatic detection and resolution of SG references
+- **AMI & Snapshot Handling**: Encrypted AMI/snapshot sharing with KMS grants
+- **Volume Migration**: All attached EBS volumes migrated with snapshots
+- **Elastic IP**: Automatic allocation and association
+- **Key Pair Validation**: Ensures key pairs exist in target account
+- **Interactive Script**: 12-step guided workflow with dry-run option
+
+### ✅ RDS Database Migration
+- **Database Instances**: PostgreSQL, MySQL, MariaDB, SQL Server, Oracle
+- **Aurora Clusters**: Full cluster migration support
+- **KMS Encryption**: Automatic KMS key recreation and snapshot re-encryption
+- **AWS-Managed Keys**: Automatic re-encryption from aws/rds to customer-managed keys
+- **Performance**: 18-20 minutes per database migration
+- **Infrastructure Reuse**: Subnet groups and security groups reused across migrations
+
+### ✅ Network Migration
+- **VPCs**: Complete VPC configuration
+- **Subnets**: All subnets with availability zones
+- **Security Groups**: With automatic dependency resolution
+- **Route Tables**: Including routes and associations
+- **NACLs**: Network access control lists
+
+### ✅ Encryption & Security
+- **KMS Handling**: Automatic key detection (AWS-managed vs customer-managed)
+- **Cross-Account Access**: KMS grants and policies configured automatically
+- **Re-encryption**: AWS-managed keys re-encrypted to customer-managed keys
+- **IAM Policies**: Comprehensive permission templates
+
+### ✅ Migration Workflow
+- **Discovery**: Automatic resource inventory
+- **Dry Run**: Validation without making changes
+- **Execution**: Actual migration with progress tracking
+- **Reporting**: Detailed JSON reports and timing summaries
+- **Validation**: Post-migration verification steps
 
 ## 🚀 Quick Start
 
@@ -431,7 +461,155 @@ docker run --rm -it \
    - Test backups before migration
    - Maintain rollback capability
 
-## 📄 IAM Permissions Required
+## � Migration Guides
+
+### EC2 Instance Migration (NEW!)
+
+**Fully automated with security group dependency resolution!**
+
+#### Quick Start - Automated Script
+
+```bash
+# Run the automated migration script
+./automated_ec2_migration.sh
+```
+
+The script provides:
+- ✅ Interactive instance selection
+- ✅ Automatic security group dependency handling
+- ✅ Dry-run validation before actual migration
+- ✅ Complete progress tracking and timing
+- ✅ 12-step guided workflow
+
+#### What Gets Migrated
+
+1. **Instance Configuration**
+   - Instance type and settings
+   - User data and metadata
+   - Tags and monitoring config
+
+2. **AMI and Snapshots**
+   - Source AMI shared and copied
+   - Encrypted AMI/snapshot handling
+   - KMS grants for cross-account access
+
+3. **Storage**
+   - All attached EBS volumes
+   - Volume snapshots created
+   - Encryption preserved
+
+4. **Security Groups (AUTO-RESOLVED)**
+   - All security groups detected
+   - Dependencies automatically resolved
+   - Rules updated with target SG IDs
+   - Circular references handled
+
+5. **Networking**
+   - Placed in target VPC/subnet
+   - Elastic IP allocated (if needed)
+   - Network interfaces configured
+
+#### Manual Docker Command
+
+```bash
+# Dry run
+docker run --rm \
+  -v ~/.aws:/root/.aws \
+  aws-migration-tool:latest \
+  --mode ec2 \
+  --ec2-instance i-0123456789abcdef0 \
+  --target-vpc vpc-0261473d76d9c5d21 \
+  --target-subnet subnet-0a1b2c3d4e5f6g7h8 \
+  --dry-run
+
+# Actual migration
+docker run --rm \
+  -v ~/.aws:/root/.aws \
+  aws-migration-tool:latest \
+  --mode ec2 \
+  --ec2-instance i-0123456789abcdef0 \
+  --target-vpc vpc-0261473d76d9c5d21 \
+  --target-subnet subnet-0a1b2c3d4e5f6g7h8
+```
+
+#### Performance
+
+- **Total Time:** 12-20 minutes per instance
+- **Security Groups:** 1-2 minutes (handles dependencies automatically)
+- **AMI Copy:** 5-8 minutes
+- **Snapshots:** 3-5 minutes
+
+#### Detailed Documentation
+
+See [EC2_MIGRATION_GUIDE.md](EC2_MIGRATION_GUIDE.md) for:
+- Complete feature documentation
+- Security group dependency explanation
+- Architecture diagrams
+- Troubleshooting guide
+- Validation steps
+- Best practices
+
+---
+
+### RDS Database Migration
+
+**Fully automated with AWS-managed KMS key handling!**
+
+#### Quick Start - Automated Script
+
+```bash
+# Run the automated migration script
+./automated_rds_migration.sh
+```
+
+The script provides:
+- ✅ Interactive database selection
+- ✅ Automatic KMS key creation and re-encryption
+- ✅ Dry-run validation before actual migration
+- ✅ Complete progress tracking
+- ✅ 12-step guided workflow
+
+#### What Gets Migrated
+
+1. **Database Configuration**
+   - Engine type and version
+   - Instance class
+   - Storage configuration
+   - Parameter groups
+
+2. **Encryption (AUTOMATIC)**
+   - Detects AWS-managed keys (aws/rds)
+   - Creates customer-managed key in source
+   - Re-encrypts snapshot for sharing
+   - Copies to target with encryption
+
+3. **Networking**
+   - DB subnet group created/reused
+   - Security group created/reused
+   - VPC placement
+
+4. **Tags and Metadata**
+   - All tags preserved
+   - Migration tracking tags added
+
+#### Performance
+
+- **Total Time:** 18-20 minutes per database
+- **KMS Setup:** Automatic (1-2 minutes)
+- **Snapshot:** 5-8 minutes
+- **Copy & Restore:** 10-12 minutes
+
+#### Detailed Documentation
+
+See [AUTOMATED_RDS_MIGRATION.md](AUTOMATED_RDS_MIGRATION.md) for:
+- Complete workflow documentation
+- KMS key handling details
+- Troubleshooting guide
+- Best practices
+
+---
+
+## �📄 IAM Permissions Required
 
 ### Source Account
 ```json

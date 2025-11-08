@@ -24,8 +24,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy migration script
+# Copy migration scripts
 COPY aws_migration.py .
+COPY migration_state.py .
 
 # Create output directory
 RUN mkdir -p /output

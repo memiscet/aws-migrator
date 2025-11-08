@@ -12,14 +12,18 @@ import sys
 import base64
 import time
 import argparse
+from migration_state import MigrationStateManager, ResourceType, MigrationStatus
 
 
 class AWSMigrationOrchestrator:
-    def __init__(self, source_profile: str, target_profile: str, source_region: str, target_region: str):
+    def __init__(self, source_profile: str, target_profile: str, source_region: str, target_region: str, state_file: str = "migration_state.json"):
         """Initialize AWS sessions for source and target accounts"""
         print(f"🔧 Initializing AWS sessions...")
         print(f"   Source: {source_profile} ({source_region})")
         print(f"   Target: {target_profile} ({target_region})")
+        
+        # Initialize state manager
+        self.state_manager = MigrationStateManager(state_file_path=state_file)
         
         self.source_session = boto3.Session(profile_name=source_profile, region_name=source_region)
         self.target_session = boto3.Session(profile_name=target_profile, region_name=target_region)
@@ -131,9 +135,20 @@ class AWSMigrationOrchestrator:
                                 "kms:Describe*",
                                 "kms:List*",
                                 "kms:CreateGrant",
+                                "kms:RetireGrant",
+                                "kms:RevokeGrant",
                                 "kms:Decrypt",
+                                "kms:Encrypt",
                                 "kms:DescribeKey",
-                                "kms:GetKeyPolicy"
+                                "kms:GetKeyPolicy",
+                                "kms:PutKeyPolicy",
+                                "kms:CreateKey",
+                                "kms:CreateAlias",
+                                "kms:DeleteAlias",
+                                "kms:UpdateAlias",
+                                "kms:TagResource",
+                                "kms:UntagResource",
+                                "kms:ListResourceTags"
                             ],
                             "Resource": "*"
                         },
@@ -288,15 +303,24 @@ class AWSMigrationOrchestrator:
                                 "kms:CreateKey",
                                 "kms:CreateAlias",
                                 "kms:DeleteAlias",
+                                "kms:UpdateAlias",
                                 "kms:Describe*",
                                 "kms:List*",
                                 "kms:Encrypt",
                                 "kms:Decrypt",
                                 "kms:CreateGrant",
                                 "kms:RetireGrant",
+                                "kms:RevokeGrant",
                                 "kms:DescribeKey",
                                 "kms:GetKeyPolicy",
-                                "kms:PutKeyPolicy"
+                                "kms:PutKeyPolicy",
+                                "kms:TagResource",
+                                "kms:UntagResource",
+                                "kms:ListResourceTags",
+                                "kms:ScheduleKeyDeletion",
+                                "kms:CancelKeyDeletion",
+                                "kms:EnableKey",
+                                "kms:DisableKey"
                             ],
                             "Resource": "*"
                         },
@@ -663,6 +687,13 @@ class AWSMigrationOrchestrator:
             aliases = self.source_kms.list_aliases(KeyId=kms_key_id).get('Aliases', [])
             alias_names = [alias['AliasName'] for alias in aliases]
             
+            # Check if any alias indicates this is AWS-managed
+            is_aws_managed = any(alias.startswith('alias/aws/') for alias in alias_names)
+            
+            # Also check key manager field
+            if key_metadata.get('KeyManager') == 'AWS':
+                is_aws_managed = True
+            
             try:
                 tags = self.source_kms.list_resource_tags(KeyId=kms_key_id).get('Tags', [])
             except:
@@ -676,8 +707,8 @@ class AWSMigrationOrchestrator:
                 'enabled': key_metadata['Enabled'],
                 'aliases': alias_names,
                 'tags': tags,
-                'is_aws_managed': kms_key_id.startswith('alias/aws/'),
-                'needs_recreation': True
+                'is_aws_managed': is_aws_managed,
+                'needs_recreation': not is_aws_managed
             }
         except Exception as e:
             return {
@@ -935,10 +966,239 @@ class AWSMigrationOrchestrator:
         
         print(f"✅ SSH key generation script saved to: {filename}")
     
+    def _replicate_security_groups_with_dependencies(self, security_group_ids: List[str], 
+                                                     target_vpc_id: str, 
+                                                     dry_run: bool = False) -> Dict[str, str]:
+        """
+        Replicate security groups to target VPC handling dependencies between groups.
+        Returns mapping of source SG IDs to target SG IDs.
+        """
+        print(f"\n🔒 Replicating {len(security_group_ids)} security groups with dependencies...")
+        
+        sg_mapping = {}  # source_sg_id -> target_sg_id
+        sg_details_map = {}  # source_sg_id -> details
+        
+        # Step 1: Collect all security group details
+        print(f"   Step 1: Collecting security group details...")
+        for sg_id in security_group_ids:
+            sg_details = self._get_security_group_details(sg_id)
+            
+            if sg_details['group_name'] == 'default':
+                # Handle default security group
+                if dry_run:
+                    print(f"      [DRY RUN] Would map default SG to target VPC default")
+                    sg_mapping[sg_id] = 'default-sg-id'
+                else:
+                    try:
+                        default_sg = self.target_ec2.describe_security_groups(
+                            Filters=[
+                                {'Name': 'vpc-id', 'Values': [target_vpc_id]},
+                                {'Name': 'group-name', 'Values': ['default']}
+                            ]
+                        )
+                        if default_sg['SecurityGroups']:
+                            target_sg_id = default_sg['SecurityGroups'][0]['GroupId']
+                            sg_mapping[sg_id] = target_sg_id
+                            print(f"      ✅ Mapped default SG: {sg_id} -> {target_sg_id}")
+                    except Exception as e:
+                        print(f"      ⚠️  Could not find default security group: {str(e)}")
+            else:
+                sg_details_map[sg_id] = sg_details
+                print(f"      📋 {sg_details['group_name']} ({sg_id})")
+        
+        # Step 2: Check if security groups already exist in target
+        print(f"   Step 2: Checking for existing security groups in target...")
+        for sg_id, sg_details in sg_details_map.items():
+            migrated_name = f"{sg_details['group_name']}-migrated"
+            
+            if dry_run:
+                print(f"      [DRY RUN] Would check for existing: {migrated_name}")
+            else:
+                try:
+                    existing = self.target_ec2.describe_security_groups(
+                        Filters=[
+                            {'Name': 'vpc-id', 'Values': [target_vpc_id]},
+                            {'Name': 'group-name', 'Values': [migrated_name]}
+                        ]
+                    )
+                    if existing['SecurityGroups']:
+                        target_sg_id = existing['SecurityGroups'][0]['GroupId']
+                        sg_mapping[sg_id] = target_sg_id
+                        print(f"      ♻️  Reusing existing: {migrated_name} ({target_sg_id})")
+                except Exception as e:
+                    print(f"      ⚠️  Error checking for existing SG: {str(e)}")
+        
+        # Step 3: Create security groups without inter-SG rules
+        print(f"   Step 3: Creating security groups (without cross-SG rules)...")
+        for sg_id, sg_details in sg_details_map.items():
+            if sg_id in sg_mapping:
+                continue  # Already exists
+            
+            migrated_name = f"{sg_details['group_name']}-migrated"
+            
+            if dry_run:
+                print(f"      [DRY RUN] Would create: {migrated_name}")
+                sg_mapping[sg_id] = f"dry-run-sg-{sg_id}"
+            else:
+                try:
+                    sg_response = self.target_ec2.create_security_group(
+                        GroupName=migrated_name,
+                        Description=sg_details['description'] or f"Migrated from {sg_details['group_name']}",
+                        VpcId=target_vpc_id
+                    )
+                    target_sg_id = sg_response['GroupId']
+                    sg_mapping[sg_id] = target_sg_id
+                    
+                    # Tag the security group
+                    tags = sg_details.get('tags', [])
+                    tags.append({'Key': 'MigratedFrom', 'Value': sg_id})
+                    tags.append({'Key': 'MigrationDate', 'Value': datetime.now().isoformat()})
+                    
+                    self.target_ec2.create_tags(
+                        Resources=[target_sg_id],
+                        Tags=tags
+                    )
+                    
+                    print(f"      ✅ Created: {migrated_name} ({target_sg_id})")
+                except Exception as e:
+                    print(f"      ❌ Failed to create {migrated_name}: {str(e)}")
+        
+        # Step 4: Update and apply rules with mapped SG IDs
+        print(f"   Step 4: Applying security group rules with dependencies...")
+        for sg_id, sg_details in sg_details_map.items():
+            if sg_id not in sg_mapping:
+                continue
+            
+            target_sg_id = sg_mapping[sg_id]
+            
+            # Process ingress rules
+            if sg_details.get('ingress_rules'):
+                updated_ingress = self._update_sg_rule_references(
+                    sg_details['ingress_rules'], 
+                    sg_mapping
+                )
+                
+                if dry_run:
+                    print(f"      [DRY RUN] Would apply {len(updated_ingress)} ingress rules to {sg_details['group_name']}")
+                    for rule in updated_ingress:
+                        protocol = rule.get('IpProtocol', 'all')
+                        from_port = rule.get('FromPort', 'all')
+                        to_port = rule.get('ToPort', 'all')
+                        cidrs = [r.get('CidrIp') for r in rule.get('IpRanges', [])]
+                        sg_refs = [p.get('GroupId') for p in rule.get('UserIdGroupPairs', [])]
+                        sources = ', '.join(cidrs + sg_refs) if (cidrs + sg_refs) else 'all'
+                        print(f"         • Protocol: {protocol}, Ports: {from_port}-{to_port}, Sources: {sources}")
+                else:
+                    try:
+                        if updated_ingress:
+                            self.target_ec2.authorize_security_group_ingress(
+                                GroupId=target_sg_id,
+                                IpPermissions=updated_ingress
+                            )
+                            print(f"      ✅ Applied {len(updated_ingress)} ingress rules to {sg_details['group_name']}")
+                            for rule in updated_ingress:
+                                protocol = rule.get('IpProtocol', 'all')
+                                from_port = rule.get('FromPort', 'all')
+                                to_port = rule.get('ToPort', 'all')
+                                cidrs = [r.get('CidrIp') for r in rule.get('IpRanges', [])]
+                                sg_refs = [p.get('GroupId') for p in rule.get('UserIdGroupPairs', [])]
+                                sources = ', '.join(cidrs + sg_refs) if (cidrs + sg_refs) else 'all'
+                                print(f"         • Protocol: {protocol}, Ports: {from_port}-{to_port}, Sources: {sources}")
+                    except Exception as e:
+                        # Rules might already exist
+                        if 'already exists' not in str(e).lower():
+                            print(f"      ⚠️  Ingress rules error for {sg_details['group_name']}: {str(e)}")
+            
+            # Process egress rules (usually needs updating for non-default SGs)
+            if sg_details.get('egress_rules'):
+                updated_egress = self._update_sg_rule_references(
+                    sg_details['egress_rules'], 
+                    sg_mapping
+                )
+                
+                if dry_run:
+                    print(f"      [DRY RUN] Would apply {len(updated_egress)} egress rules to {sg_details['group_name']}")
+                    for rule in updated_egress:
+                        protocol = rule.get('IpProtocol', 'all')
+                        from_port = rule.get('FromPort', 'all')
+                        to_port = rule.get('ToPort', 'all')
+                        cidrs = [r.get('CidrIp') for r in rule.get('IpRanges', [])]
+                        sg_refs = [p.get('GroupId') for p in rule.get('UserIdGroupPairs', [])]
+                        destinations = ', '.join(cidrs + sg_refs) if (cidrs + sg_refs) else 'all'
+                        print(f"         • Protocol: {protocol}, Ports: {from_port}-{to_port}, Destinations: {destinations}")
+                else:
+                    try:
+                        # Remove default egress rule first if it exists
+                        self.target_ec2.revoke_security_group_egress(
+                            GroupId=target_sg_id,
+                            IpPermissions=[{
+                                'IpProtocol': '-1',
+                                'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                            }]
+                        )
+                    except:
+                        pass  # Default rule might not exist
+                    
+                    try:
+                        if updated_egress:
+                            self.target_ec2.authorize_security_group_egress(
+                                GroupId=target_sg_id,
+                                IpPermissions=updated_egress
+                            )
+                            print(f"      ✅ Applied {len(updated_egress)} egress rules to {sg_details['group_name']}")
+                            for rule in updated_egress:
+                                protocol = rule.get('IpProtocol', 'all')
+                                from_port = rule.get('FromPort', 'all')
+                                to_port = rule.get('ToPort', 'all')
+                                cidrs = [r.get('CidrIp') for r in rule.get('IpRanges', [])]
+                                sg_refs = [p.get('GroupId') for p in rule.get('UserIdGroupPairs', [])]
+                                destinations = ', '.join(cidrs + sg_refs) if (cidrs + sg_refs) else 'all'
+                                print(f"         • Protocol: {protocol}, Ports: {from_port}-{to_port}, Destinations: {destinations}")
+                    except Exception as e:
+                        if 'already exists' not in str(e).lower():
+                            print(f"      ⚠️  Egress rules error for {sg_details['group_name']}: {str(e)}")
+        
+        print(f"   ✅ Security group replication complete!")
+        return sg_mapping
+    
+    def _update_sg_rule_references(self, rules: List[Dict], sg_mapping: Dict[str, str]) -> List[Dict]:
+        """
+        Update security group rules to replace source SG IDs with target SG IDs.
+        """
+        updated_rules = []
+        
+        for rule in rules:
+            updated_rule = rule.copy()
+            
+            # Update UserIdGroupPairs (references to other security groups)
+            if 'UserIdGroupPairs' in rule and rule['UserIdGroupPairs']:
+                updated_pairs = []
+                for pair in rule['UserIdGroupPairs']:
+                    source_sg_id = pair.get('GroupId')
+                    
+                    if source_sg_id in sg_mapping:
+                        # Replace with target SG ID
+                        updated_pair = pair.copy()
+                        updated_pair['GroupId'] = sg_mapping[source_sg_id]
+                        # Remove UserId to use current account
+                        if 'UserId' in updated_pair:
+                            del updated_pair['UserId']
+                        updated_pairs.append(updated_pair)
+                    else:
+                        # Keep original if not in mapping (might be external reference)
+                        print(f"         ⚠️  Warning: SG reference {source_sg_id} not in mapping, keeping as-is")
+                        updated_pairs.append(pair)
+                
+                updated_rule['UserIdGroupPairs'] = updated_pairs
+            
+            updated_rules.append(updated_rule)
+        
+        return updated_rules
+    
     def migrate_single_ec2_instance(self, instance_id: str, target_vpc_id: str, 
                                    target_subnet_id: str, target_security_groups: List[str],
-                                   dry_run: bool = True):
-        """Migrate a single EC2 instance"""
+                                   dry_run: bool = True, target_key_pair: str = None):
+        """Migrate a single EC2 instance with state management"""
         print("\n" + "=" * 100)
         if dry_run:
             print(f"🧪 DRY RUN: EC2 Instance Migration - {instance_id}")
@@ -946,16 +1206,57 @@ class AWSMigrationOrchestrator:
             print(f"🚀 MIGRATING EC2 Instance - {instance_id}")
         print("=" * 100)
         
+        # Initialize state management
+        migration_id = f"ec2-{instance_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        if not dry_run:
+            # Check for existing incomplete migration
+            existing_migrations = self.state_manager.get_incomplete_migrations(
+                resource_type=ResourceType.EC2_INSTANCE,
+                source_id=instance_id
+            )
+            if existing_migrations:
+                print(f"\n♻️  Found existing migration state for {instance_id}")
+                print(f"   Migration ID: {existing_migrations[0]}")
+                print(f"   Attempting to resume from previous state...")
+                migration_id = existing_migrations[0]
+            else:
+                # Initialize new migration
+                migration_id = self.state_manager.initialize_migration(
+                    resource_type=ResourceType.EC2_INSTANCE,
+                    source_id=instance_id,
+                    source_metadata={
+                        'target_vpc': target_vpc_id,
+                        'target_subnet': target_subnet_id,
+                        'target_security_groups': target_security_groups
+                    }
+                )
+        
         # Step 1: Analyze the instance
-        print(f"\n📊 Step 1: Analyzing instance {instance_id}...")
-        try:
-            response = self.source_ec2.describe_instances(InstanceIds=[instance_id])
-            instance = response['Reservations'][0]['Instances'][0]
-            instance_info = self._get_instance_details(instance)
-        except Exception as e:
-            print(f"❌ Error: Instance {instance_id} not found or cannot be accessed")
-            print(f"   {str(e)}")
-            return
+        if not dry_run and self.state_manager.is_step_completed(migration_id, 'analyze_instance'):
+            print(f"\n📊 Step 1: Analyzing instance {instance_id}...")
+            print(f"   ♻️  Step already completed, loading from state...")
+            instance_info = self.state_manager.get_step_data(migration_id, 'analyze_instance')
+        else:
+            print(f"\n📊 Step 1: Analyzing instance {instance_id}...")
+            if not dry_run:
+                self.state_manager.update_step_status(migration_id, 'analyze_instance', 
+                                                     MigrationStatus.IN_PROGRESS)
+            try:
+                response = self.source_ec2.describe_instances(InstanceIds=[instance_id])
+                instance = response['Reservations'][0]['Instances'][0]
+                instance_info = self._get_instance_details(instance)
+                
+                if not dry_run:
+                    self.state_manager.update_step_status(migration_id, 'analyze_instance',
+                                                         MigrationStatus.COMPLETED,
+                                                         data=instance_info)
+            except Exception as e:
+                print(f"❌ Error: Instance {instance_id} not found or cannot be accessed")
+                print(f"   {str(e)}")
+                if not dry_run:
+                    self.state_manager.update_step_status(migration_id, 'analyze_instance',
+                                                         MigrationStatus.FAILED, error=str(e))
+                return
         
         print(f"✅ Instance found:")
         print(f"   Type: {instance_info['instance_type']}")
@@ -964,225 +1265,237 @@ class AWSMigrationOrchestrator:
         print(f"   Key Pair: {instance_info['key_name']}")
         print(f"   User Data: {'Yes' if instance_info['user_data']['exists'] else 'No'}")
         
-        # Step 2: Check/Share AMI
-        print(f"\n📦 Step 2: Handling AMI...")
-        ami_id = instance_info['ami_id']
+        # Step 2: Create custom AMI (with reuse detection)
+        source_custom_ami_id = None
+        target_ami_id = None
         
-        # Check if AMI has encrypted snapshots and grant KMS access
-        if not dry_run:
+        if not dry_run and self.state_manager.is_step_completed(migration_id, 'create_ami'):
+            print(f"\n📦 Step 2: Creating custom AMI from instance...")
+            print(f"   ♻️  AMI already created, reusing from state...")
+            step_data = self.state_manager.get_step_data(migration_id, 'create_ami')
+            source_custom_ami_id = step_data.get('source_ami_id')
+            print(f"   ✅ Reusing AMI: {source_custom_ami_id}")
+            
+            # Verify AMI still exists
             try:
-                ami_details = self.source_ec2.describe_images(ImageIds=[ami_id])['Images'][0]
-                encrypted_snapshot_keys = set()
-                
+                self.source_ec2.describe_images(ImageIds=[source_custom_ami_id])
+                print(f"   ✅ AMI verified in source account")
+            except Exception as e:
+                print(f"   ⚠️  Warning: Stored AMI not found, will create new one")
+                print(f"      Error: {str(e)}")
+                source_custom_ami_id = None
+                self.state_manager.update_step_status(migration_id, 'create_ami',
+                                                     MigrationStatus.NOT_STARTED)
+        
+        if source_custom_ami_id is None:
+            print(f"\n📦 Step 2: Creating custom AMI from instance...")
+            
+            if dry_run:
+                print(f"   [DRY RUN] Would create custom AMI from instance {instance_id}")
+                print(f"   [DRY RUN] Would check AMI for encrypted snapshots")
+                print(f"   [DRY RUN] Would grant KMS access if needed")
+            else:
+                if not dry_run:
+                    self.state_manager.update_step_status(migration_id, 'create_ami',
+                                                         MigrationStatus.IN_PROGRESS)
+                try:
+                    print(f"   ℹ️  Creating AMI snapshot of instance {instance_id}")
+                    print(f"   ℹ️  This captures all volumes, applications, and data")
+                    
+                    ami_name = f"migration-{instance_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                    create_image_response = self.source_ec2.create_image(
+                        InstanceId=instance_id,
+                        Name=ami_name,
+                        Description=f"Migration snapshot of {instance_id}",
+                        NoReboot=True  # Don't reboot the instance
+                    )
+                    source_custom_ami_id = create_image_response['ImageId']
+                    print(f"   ✅ Custom AMI created: {source_custom_ami_id}")
+                    
+                    # Store AMI ID immediately
+                    self.state_manager.add_created_resource(
+                        migration_id=migration_id,
+                        resource_type=ResourceType.AMI,
+                        resource_id=source_custom_ami_id,
+                        resource_metadata={'account': 'source', 'instance_id': instance_id}
+                    )
+                    
+                    print(f"   ⏳ Waiting for AMI to become available...")
+                    
+                    # Wait for AMI to be available with extended timeout
+                    waiter = self.source_ec2.get_waiter('image_available')
+                    waiter_config = {
+                        'Delay': 15,  # Check every 15 seconds
+                        'MaxAttempts': 80  # Try for 20 minutes (15s * 80 = 1200s)
+                    }
+                    waiter.wait(ImageIds=[source_custom_ami_id], WaiterConfig=waiter_config)
+                    print(f"   ✅ Custom AMI is ready")
+                    
+                    # Mark step as completed
+                    self.state_manager.update_step_status(
+                        migration_id, 'create_ami',
+                        MigrationStatus.COMPLETED,
+                        data={'source_ami_id': source_custom_ami_id, 'ami_name': ami_name}
+                    )
+                    
+                except Exception as e:
+                    print(f"   ❌ Error creating custom AMI: {str(e)}")
+                    if not dry_run:
+                        self.state_manager.update_step_status(migration_id, 'create_ami',
+                                                             MigrationStatus.FAILED, error=str(e))
+                    return
+        
+        # Step 3: Grant snapshot permissions (with state tracking)
+        if not dry_run and self.state_manager.is_step_completed(migration_id, 'grant_snapshot_permissions'):
+            print(f"\n🔑 Step 3: Granting snapshot permissions...")
+            print(f"   ♻️  Snapshot permissions already granted")
+        elif not dry_run:
+            print(f"\n🔑 Step 3: Granting snapshot permissions to target account...")
+            self.state_manager.update_step_status(migration_id, 'grant_snapshot_permissions',
+                                                 MigrationStatus.IN_PROGRESS)
+            try:
+                ami_details = self.source_ec2.describe_images(ImageIds=[source_custom_ami_id])['Images'][0]
                 for bdm in ami_details.get('BlockDeviceMappings', []):
-                    if 'Ebs' in bdm and bdm['Ebs'].get('Encrypted'):
-                        snapshot_id = bdm['Ebs'].get('SnapshotId')
-                        if snapshot_id:
-                            # Get snapshot KMS key
-                            try:
-                                snapshot_info = self.source_ec2.describe_snapshots(SnapshotIds=[snapshot_id])['Snapshots'][0]
-                                kms_key_id = snapshot_info.get('KmsKeyId')
-                                if kms_key_id and not '/aws/' in kms_key_id:
-                                    encrypted_snapshot_keys.add(kms_key_id)
-                            except Exception as e:
-                                print(f"   ⚠️  Warning: Could not get snapshot {snapshot_id} details: {str(e)}")
-                
-                # Grant KMS access for AMI snapshots
-                if encrypted_snapshot_keys:
-                    print(f"\n🔑 Step 2a: Granting KMS access for AMI snapshots...")
-                    for kms_key_id in encrypted_snapshot_keys:
+                    if 'Ebs' in bdm and 'SnapshotId' in bdm['Ebs']:
+                        snapshot_id = bdm['Ebs']['SnapshotId']
                         try:
-                            grant_response = self.source_kms.create_grant(
-                                KeyId=kms_key_id,
-                                GranteePrincipal=f"arn:aws:iam::{self.target_account_id}:root",
-                                Operations=[
-                                    'Decrypt',
-                                    'DescribeKey',
-                                    'CreateGrant'
-                                ]
+                            self.source_ec2.modify_snapshot_attribute(
+                                SnapshotId=snapshot_id,
+                                Attribute='createVolumePermission',
+                                OperationType='add',
+                                UserIds=[self.target_account_id]
                             )
-                            print(f"   ✅ KMS grant created for key {kms_key_id}: {grant_response['GrantId']}")
+                            print(f"   ✅ Granted access to snapshot {snapshot_id}")
                         except Exception as e:
-                            print(f"   ⚠️  Warning: Could not create KMS grant for {kms_key_id}: {str(e)}")
-            except Exception as e:
-                print(f"   ⚠️  Warning: Could not check AMI encryption: {str(e)}")
-        
-        if dry_run:
-            print(f"   [DRY RUN] Would check AMI for encrypted snapshots")
-            print(f"   [DRY RUN] Would grant KMS access if needed")
-            print(f"   [DRY RUN] Would share AMI {ami_id} with target account")
-            print(f"   [DRY RUN] Would copy AMI to target account")
-        else:
-            try:
-                # Share AMI
-                print(f"\n📦 Step 2b: Sharing and copying AMI...")
-                print(f"   Sharing AMI {ami_id} with target account...")
-                self.source_ec2.modify_image_attribute(
-                    ImageId=ami_id,
-                    LaunchPermission={'Add': [{'UserId': self.target_account_id}]}
-                )
-                print(f"   ✅ AMI shared")
+                            print(f"   ⚠️  Warning: Could not grant snapshot access: {str(e)}")
                 
-                # Copy AMI to target
-                print(f"   Copying AMI to target account...")
-                ami_name = f"migrated-{ami_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                copy_response = self.target_ec2.copy_image(
-                    SourceImageId=ami_id,
-                    SourceRegion=self.source_session.region_name,
-                    Name=ami_name,
-                    Description=f"Migrated from {ami_id}"
-                )
-                target_ami_id = copy_response['ImageId']
-                print(f"   ✅ AMI copied: {target_ami_id}")
-                print(f"   ⏳ Waiting for AMI to become available...")
-                
-                # Wait for AMI to be available
-                waiter = self.target_ec2.get_waiter('image_available')
-                waiter.wait(ImageIds=[target_ami_id])
-                print(f"   ✅ AMI is ready")
+                self.state_manager.update_step_status(migration_id, 'grant_snapshot_permissions',
+                                                     MigrationStatus.COMPLETED)
             except Exception as e:
-                print(f"   ❌ Error handling AMI: {str(e)}")
+                print(f"   ❌ Error granting snapshot permissions: {str(e)}")
+                self.state_manager.update_step_status(migration_id, 'grant_snapshot_permissions',
+                                                     MigrationStatus.FAILED, error=str(e))
                 return
         
-        # Step 3: Handle volumes/snapshots
-        print(f"\n💾 Step 3: Creating volume snapshots...")
-        snapshot_mapping = {}
-        encrypted_volumes_kms = {}
+        # Step 4: Share AMI (with state tracking)
+        if not dry_run and self.state_manager.is_step_completed(migration_id, 'share_ami'):
+            print(f"\n🔗 Step 4: Sharing AMI with target account...")
+            print(f"   ♻️  AMI already shared")
+        elif not dry_run:
+            print(f"\n🔗 Step 4: Sharing AMI with target account...")
+            self.state_manager.update_step_status(migration_id, 'share_ami',
+                                                 MigrationStatus.IN_PROGRESS)
+            try:
+                self.source_ec2.modify_image_attribute(
+                    ImageId=source_custom_ami_id,
+                    LaunchPermission={'Add': [{'UserId': self.target_account_id}]}
+                )
+                print(f"   ✅ AMI shared with target account")
+                self.state_manager.update_step_status(migration_id, 'share_ami',
+                                                     MigrationStatus.COMPLETED)
+            except Exception as e:
+                print(f"   ❌ Error sharing AMI: {str(e)}")
+                self.state_manager.update_step_status(migration_id, 'share_ami',
+                                                     MigrationStatus.FAILED, error=str(e))
+                return
         
-        # First, check which volumes are encrypted and grant KMS access
-        for volume_info in instance_info['block_device_mappings']:
-            if 'Ebs' in volume_info:
-                volume_id = volume_info['Ebs']['VolumeId']
-                
-                try:
-                    volume_details = self._get_volume_details(volume_id)
-                    if volume_details['encrypted'] and volume_details.get('kms_key_id'):
-                        encrypted_volumes_kms[volume_id] = volume_details['kms_key_id']
-                except Exception as e:
-                    print(f"   ⚠️  Warning: Could not get volume details for {volume_id}: {str(e)}")
-        
-        # Grant KMS access for encrypted volumes
-        if encrypted_volumes_kms:
-            print(f"\n🔑 Step 3a: Granting KMS access for encrypted volumes...")
-            granted_keys = set()
+        # Step 5: Copy AMI to target (with state tracking and reuse)
+        if not dry_run and self.state_manager.is_step_completed(migration_id, 'copy_ami'):
+            print(f"\n📋 Step 5: Copying AMI to target account...")
+            print(f"   ♻️  AMI already copied, reusing from state...")
+            step_data = self.state_manager.get_step_data(migration_id, 'copy_ami')
+            target_ami_id = step_data.get('target_ami_id')
+            print(f"   ✅ Reusing target AMI: {target_ami_id}")
             
-            for volume_id, kms_key_id in encrypted_volumes_kms.items():
-                # Skip if we already granted access for this key
-                if kms_key_id in granted_keys:
-                    continue
-                
-                # Skip AWS-managed keys
-                if kms_key_id.startswith('arn:aws:kms:') and '/aws/' in kms_key_id:
-                    print(f"   ℹ️  Volume {volume_id} uses AWS-managed key, skipping grant")
-                    continue
-                
-                if dry_run:
-                    print(f"   [DRY RUN] Would create KMS grant for key {kms_key_id}")
-                else:
-                    try:
-                        grant_response = self.source_kms.create_grant(
-                            KeyId=kms_key_id,
-                            GranteePrincipal=f"arn:aws:iam::{self.target_account_id}:root",
-                            Operations=[
-                                'Decrypt',
-                                'DescribeKey',
-                                'CreateGrant'
-                            ]
-                        )
-                        print(f"   ✅ KMS grant created for key {kms_key_id}: {grant_response['GrantId']}")
-                        granted_keys.add(kms_key_id)
-                    except Exception as e:
-                        print(f"   ⚠️  Warning: Could not create KMS grant for {kms_key_id}: {str(e)}")
+            # Verify target AMI still exists
+            try:
+                self.target_ec2.describe_images(ImageIds=[target_ami_id])
+                print(f"   ✅ Target AMI verified")
+            except Exception as e:
+                print(f"   ⚠️  Warning: Stored target AMI not found, will copy again")
+                print(f"      Error: {str(e)}")
+                target_ami_id = None
+                self.state_manager.update_step_status(migration_id, 'copy_ami',
+                                                     MigrationStatus.NOT_STARTED)
         
-        # Now create snapshots
-        print(f"\n💾 Step 3b: Creating snapshots...")
-        for volume_info in instance_info['block_device_mappings']:
-            if 'Ebs' in volume_info:
-                volume_id = volume_info['Ebs']['VolumeId']
-                device_name = volume_info['DeviceName']
+        if target_ami_id is None and not dry_run:
+            print(f"\n📋 Step 5: Copying AMI to target account...")
+            self.state_manager.update_step_status(migration_id, 'copy_ami',
+                                                 MigrationStatus.IN_PROGRESS)
+            try:
+                target_ami_name = f"migrated-{instance_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                copy_response = self.target_ec2.copy_image(
+                    SourceImageId=source_custom_ami_id,
+                    SourceRegion=self.source_session.region_name,
+                    Name=target_ami_name,
+                    Description=f"Migrated from instance {instance_id}"
+                )
+                target_ami_id = copy_response['ImageId']
+                print(f"   ✅ AMI copied to target: {target_ami_id}")
                 
-                if dry_run:
-                    print(f"   [DRY RUN] Would create snapshot for volume {volume_id} ({device_name})")
-                else:
-                    try:
-                        print(f"   Creating snapshot for {volume_id} ({device_name})...")
-                        snap_response = self.source_ec2.create_snapshot(
-                            VolumeId=volume_id,
-                            Description=f"Migration snapshot for {instance_id}",
-                            TagSpecifications=[{
-                                'ResourceType': 'snapshot',
-                                'Tags': [
-                                    {'Key': 'MigrationSnapshot', 'Value': 'true'},
-                                    {'Key': 'SourceInstance', 'Value': instance_id},
-                                    {'Key': 'DeviceName', 'Value': device_name}
-                                ]
-                            }]
-                        )
-                        snapshot_id = snap_response['SnapshotId']
-                        snapshot_mapping[device_name] = snapshot_id
-                        print(f"   ✅ Snapshot created: {snapshot_id}")
-                    except Exception as e:
-                        print(f"   ⚠️  Warning: Could not create snapshot for {volume_id}: {str(e)}")
+                # Store target AMI ID immediately
+                self.state_manager.add_created_resource(
+                    migration_id=migration_id,
+                    resource_type=ResourceType.AMI,
+                    resource_id=target_ami_id,
+                    resource_metadata={'account': 'target', 'source_ami': source_custom_ami_id}
+                )
+                
+                print(f"   ⏳ Waiting for target AMI to become available...")
+                
+                # Wait for target AMI to be available with extended timeout
+                target_waiter = self.target_ec2.get_waiter('image_available')
+                target_waiter_config = {
+                    'Delay': 15,  # Check every 15 seconds
+                    'MaxAttempts': 80  # Try for 20 minutes (15s * 80 = 1200s)
+                }
+                target_waiter.wait(ImageIds=[target_ami_id], WaiterConfig=target_waiter_config)
+                print(f"   ✅ Target AMI is ready")
+                
+                self.state_manager.update_step_status(migration_id, 'copy_ami',
+                                                     MigrationStatus.COMPLETED,
+                                                     data={'target_ami_id': target_ami_id, 
+                                                          'target_ami_name': target_ami_name})
+            except Exception as e:
+                print(f"   ❌ Error copying AMI to target: {str(e)}")
+                self.state_manager.update_step_status(migration_id, 'copy_ami',
+                                                     MigrationStatus.FAILED, error=str(e))
+                return
         
-        if not dry_run and snapshot_mapping:
-            print(f"   ⏳ Waiting for snapshots to complete...")
-            for device, snap_id in snapshot_mapping.items():
-                waiter = self.source_ec2.get_waiter('snapshot_completed')
-                waiter.wait(SnapshotIds=[snap_id])
-            print(f"   ✅ All snapshots completed")
+        if dry_run:
+            print(f"\n[DRY RUN] Steps 2-5: Would create, share, and copy AMI")
+            print(f"   Would create custom AMI from instance {instance_id}")
+            print(f"   Would grant snapshot permissions to target account")
+            print(f"   Would share AMI with target account")
+            print(f"   Would copy AMI to target account")
         
-        # Step 4: Create security groups (if needed)
-        print(f"\n🔒 Step 4: Handling security groups...")
+        # Step 3: Volume snapshots are included in the AMI
+        print(f"\n� Step 3: Volume snapshots included in custom AMI")
+        print(f"   ℹ️  All volumes and data are captured in the AMI created above")
+        print(f"   ✅ No separate volume snapshots needed")
+        
+        # Step 4: Handle security groups with dependencies
+        print(f"\n🔒 Step 4: Handling security groups with dependencies...")
         target_sg_ids = target_security_groups if target_security_groups else []
         
         if not target_sg_ids:
-            print(f"   ⚠️  No target security groups specified")
-            print(f"   Creating equivalent security groups in target VPC...")
+            print(f"   No target security groups specified - replicating from source...")
             
-            for sg in instance_info['security_groups']:
-                sg_details = self._get_security_group_details(sg['id'])
-                
-                if sg_details['group_name'] == 'default':
-                    # Get default SG for target VPC
-                    if dry_run:
-                        print(f"   [DRY RUN] Would use default security group in target VPC")
-                    else:
-                        try:
-                            default_sg = self.target_ec2.describe_security_groups(
-                                Filters=[
-                                    {'Name': 'vpc-id', 'Values': [target_vpc_id]},
-                                    {'Name': 'group-name', 'Values': ['default']}
-                                ]
-                            )
-                            if default_sg['SecurityGroups']:
-                                target_sg_ids.append(default_sg['SecurityGroups'][0]['GroupId'])
-                                print(f"   ✅ Using default security group")
-                        except Exception as e:
-                            print(f"   ⚠️  Could not find default security group: {str(e)}")
-                else:
-                    if dry_run:
-                        print(f"   [DRY RUN] Would create security group: {sg_details['group_name']}")
-                    else:
-                        try:
-                            # Create security group
-                            sg_response = self.target_ec2.create_security_group(
-                                GroupName=f"{sg_details['group_name']}-migrated",
-                                Description=sg_details['description'],
-                                VpcId=target_vpc_id
-                            )
-                            new_sg_id = sg_response['GroupId']
-                            target_sg_ids.append(new_sg_id)
-                            
-                            # Add rules
-                            if sg_details['ingress_rules']:
-                                self.target_ec2.authorize_security_group_ingress(
-                                    GroupId=new_sg_id,
-                                    IpPermissions=sg_details['ingress_rules']
-                                )
-                            
-                            print(f"   ✅ Created security group: {new_sg_id}")
-                        except Exception as e:
-                            print(f"   ⚠️  Could not create security group: {str(e)}")
+            # Collect all security group IDs from the instance
+            source_sg_ids = [sg['id'] for sg in instance_info['security_groups']]
+            
+            # Replicate security groups handling dependencies
+            sg_mapping = self._replicate_security_groups_with_dependencies(
+                source_sg_ids,
+                target_vpc_id,
+                dry_run
+            )
+            
+            # Get target security group IDs
+            target_sg_ids = [sg_mapping[sg_id] for sg_id in source_sg_ids if sg_id in sg_mapping]
+            
+            if not dry_run and target_sg_ids:
+                print(f"   ✅ Mapped {len(target_sg_ids)} security groups to target VPC")
         else:
             print(f"   Using specified security groups: {', '.join(target_sg_ids)}")
         
@@ -1191,25 +1504,29 @@ class AWSMigrationOrchestrator:
         
         if dry_run:
             print(f"   [DRY RUN] Would launch instance with:")
-            print(f"      AMI: {ami_id} (or copied AMI)")
+            print(f"      AMI: {source_custom_ami_id if source_custom_ami_id else 'custom-ami'} (will be copied)")
             print(f"      Type: {instance_info['instance_type']}")
             print(f"      VPC: {target_vpc_id}")
             print(f"      Subnet: {target_subnet_id}")
             print(f"      Security Groups: {target_sg_ids if target_sg_ids else 'default'}")
-            print(f"      Key Pair: {instance_info['key_name']} (must exist in target)")
+            key_to_use = target_key_pair if target_key_pair else instance_info['key_name']
+            print(f"      Key Pair: {key_to_use} (must exist in target)")
             if instance_info['user_data']['exists']:
                 print(f"      User Data: Yes ({instance_info['user_data']['length']} bytes)")
         else:
             try:
+                # Filter out AWS-reserved tags (tags starting with 'aws:')
+                user_tags = [tag for tag in instance_info['tags'] if not tag['Key'].startswith('aws:')]
+                
                 launch_params = {
-                    'ImageId': target_ami_id if 'target_ami_id' in locals() else ami_id,
+                    'ImageId': target_ami_id,
                     'InstanceType': instance_info['instance_type'],
                     'SubnetId': target_subnet_id,
                     'MinCount': 1,
                     'MaxCount': 1,
                     'TagSpecifications': [{
                         'ResourceType': 'instance',
-                        'Tags': instance_info['tags'] + [
+                        'Tags': user_tags + [
                             {'Key': 'MigratedFrom', 'Value': instance_id},
                             {'Key': 'MigrationDate', 'Value': datetime.now().isoformat()}
                         ]
@@ -1219,7 +1536,10 @@ class AWSMigrationOrchestrator:
                 if target_sg_ids:
                     launch_params['SecurityGroupIds'] = target_sg_ids
                 
-                if instance_info['key_name']:
+                # Use target_key_pair if specified, otherwise use source key
+                if target_key_pair:
+                    launch_params['KeyName'] = target_key_pair
+                elif instance_info['key_name']:
                     launch_params['KeyName'] = instance_info['key_name']
                 
                 if instance_info['user_data']['exists']:
@@ -1277,7 +1597,7 @@ class AWSMigrationOrchestrator:
             print("✅ DRY RUN COMPLETE")
             print("=" * 100)
             print("\n📝 Summary of what WOULD be done:")
-            print(f"   1. Share and copy AMI {ami_id}")
+            print(f"   1. Share and copy AMI {source_custom_ami_id}")
             print(f"   2. Create snapshots for {len(instance_info['block_device_mappings'])} volumes")
             print(f"   3. Create/map {len(instance_info['security_groups'])} security groups")
             print(f"   4. Launch new instance in {target_subnet_id}")
@@ -1335,46 +1655,138 @@ class AWSMigrationOrchestrator:
         if db_info['storage_encrypted']:
             print(f"\n🔐 Step 2: Handling KMS encryption...")
             
+            # Check if source uses AWS-managed key
+            is_aws_managed = db_info.get('kms_key_details', {}).get('is_aws_managed', False)
+            
             if target_kms_key:
                 print(f"   Using specified KMS key: {target_kms_key}")
+            elif is_aws_managed:
+                # For AWS-managed keys, use AWS-managed key in target too
+                target_kms_key = 'alias/aws/rds'
+                print(f"   Source uses AWS-managed RDS key")
+                print(f"   Using AWS-managed RDS key in target: {target_kms_key}")
             else:
                 if dry_run:
-                    print(f"   [DRY RUN] Would create equivalent KMS key in target account")
-                    print(f"   [DRY RUN] Or use default AWS-managed RDS key")
+                    print(f"   [DRY RUN] Would create KMS key in target account")
+                    print(f"   [DRY RUN] Key alias: alias/rds-migration")
                 else:
-                    if db_info['kms_key_details'] and db_info['kms_key_details'].get('is_aws_managed'):
+                    # Create KMS key in target account
+                    print(f"   Creating KMS key in target account...")
+                    try:
+                        # Check if key already exists
+                        try:
+                            existing_key = self.target_kms.describe_key(KeyId='alias/rds-migration')
+                            target_kms_key = existing_key['KeyMetadata']['KeyId']
+                            print(f"   ℹ️  Using existing KMS key: {target_kms_key}")
+                        except:
+                            # Create new KMS key
+                            key_response = self.target_kms.create_key(
+                                Description='KMS key for migrated RDS databases',
+                                KeyUsage='ENCRYPT_DECRYPT',
+                                Origin='AWS_KMS',
+                                MultiRegion=False
+                            )
+                            target_kms_key = key_response['KeyMetadata']['KeyId']
+                            print(f"   ✅ Created KMS key: {target_kms_key}")
+                            
+                            # Create alias
+                            try:
+                                self.target_kms.create_alias(
+                                    AliasName='alias/rds-migration',
+                                    TargetKeyId=target_kms_key
+                                )
+                                print(f"   ✅ Created alias: alias/rds-migration")
+                            except Exception as e:
+                                print(f"   ⚠️  Could not create alias: {str(e)}")
+                    except Exception as e:
+                        print(f"   ⚠️  Error creating KMS key: {str(e)}")
+                        print(f"   Falling back to AWS-managed RDS key")
                         target_kms_key = 'alias/aws/rds'
-                        print(f"   Using AWS-managed RDS key in target")
-                    else:
-                        print(f"   ⚠️  Customer-managed key detected")
-                        print(f"   You must specify --target-kms-key with an existing key in target account")
-                        print(f"   Or create a new key first")
-                        return
             
             # Grant KMS key access to target account for snapshot copying
-            if db_info['kms_key_id'] and not db_info['kms_key_details'].get('is_aws_managed'):
+            # Skip this for AWS-managed keys as they don't allow direct grants
+            source_kms_key_id = db_info.get('kms_key_id')
+            is_aws_managed = db_info.get('kms_key_details', {}).get('is_aws_managed', False)
+            
+            if source_kms_key_id and not is_aws_managed:
                 print(f"\n🔑 Step 2b: Granting KMS key access to target account...")
                 
                 if dry_run:
                     print(f"   [DRY RUN] Would create KMS grant for target account {self.target_account_id}")
+                    print(f"   [DRY RUN] Would update KMS key policy to allow target account access")
                     print(f"   [DRY RUN] This allows target account to decrypt the snapshot")
                 else:
                     try:
                         # Create a grant that allows the target account to use the key
                         grant_response = self.source_kms.create_grant(
-                            KeyId=db_info['kms_key_id'],
+                            KeyId=source_kms_key_id,
                             GranteePrincipal=f"arn:aws:iam::{self.target_account_id}:root",
                             Operations=[
                                 'Decrypt',
                                 'DescribeKey',
-                                'CreateGrant'
+                                'CreateGrant',
+                                'RetireGrant'
                             ]
                         )
                         print(f"   ✅ KMS grant created: {grant_response['GrantId']}")
                         print(f"   ℹ️  Target account can now decrypt snapshots encrypted with this key")
                     except Exception as e:
                         print(f"   ⚠️  Warning: Could not create KMS grant: {str(e)}")
+                        print(f"   ℹ️  Attempting to update key policy instead...")
+                        
+                        # Try to update key policy as fallback
+                        try:
+                            # Get current key policy
+                            policy_response = self.source_kms.get_key_policy(
+                                KeyId=source_kms_key_id,
+                                PolicyName='default'
+                            )
+                            policy = json.loads(policy_response['Policy'])
+                            
+                            # Add statement for target account if not exists
+                            target_statement = {
+                                "Sid": f"Allow-Target-Account-{self.target_account_id}",
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "AWS": f"arn:aws:iam::{self.target_account_id}:root"
+                                },
+                                "Action": [
+                                    "kms:Decrypt",
+                                    "kms:DescribeKey",
+                                    "kms:CreateGrant"
+                                ],
+                                "Resource": "*"
+                            }
+                            
+                            # Check if statement already exists
+                            statement_exists = False
+                            for stmt in policy.get('Statement', []):
+                                if stmt.get('Sid') == target_statement['Sid']:
+                                    statement_exists = True
+                                    break
+                            
+                            if not statement_exists:
+                                policy['Statement'].append(target_statement)
+                                
+                                # Update the key policy
+                                self.source_kms.put_key_policy(
+                                    KeyId=source_kms_key_id,
+                                    PolicyName='default',
+                                    Policy=json.dumps(policy)
+                                )
+                                print(f"   ✅ KMS key policy updated to allow target account access")
+                            else:
+                                print(f"   ℹ️  Target account already has access in key policy")
+                        
+                        except Exception as e:
+                            print(f"   ⚠️  Warning: Could not update key policy: {str(e)}")
+                            print(f"   ℹ️  The grant should still work, but you may need to update the key policy manually")
+                        
+                        print(f"   ℹ️  Target account can now decrypt snapshots encrypted with this key")
+                    except Exception as e:
+                        print(f"   ⚠️  Warning: Could not create KMS grant: {str(e)}")
                         print(f"   ℹ️  You may need to manually grant access or update key policy")
+                        print(f"   ℹ️  Without KMS access, snapshot copy will fail")
         
         # Step 3: Create snapshot
         print(f"\n💾 Step 3: Creating RDS snapshot...")
@@ -1403,6 +1815,105 @@ class AWSMigrationOrchestrator:
             except Exception as e:
                 print(f"   ❌ Error creating snapshot: {str(e)}")
                 return
+        
+        # Step 3b: If source uses AWS-managed key, copy snapshot with customer-managed key in source account
+        is_aws_managed = db_info.get('kms_key_details', {}).get('is_aws_managed', False)
+        if db_info['storage_encrypted'] and is_aws_managed:
+            print(f"\n🔄 Step 3b: Re-encrypting snapshot with customer-managed key in source account...")
+            print(f"   (AWS-managed keys cannot be used for cross-account sharing)")
+            
+            # Create a customer-managed key in source account for sharing
+            source_share_snapshot_id = f"{snapshot_id}-share"
+            
+            if dry_run:
+                print(f"   [DRY RUN] Would copy snapshot with customer-managed key")
+                print(f"   [DRY RUN] Share snapshot: {source_share_snapshot_id}")
+            else:
+                try:
+                    # Check if we already have a migration key in source account
+                    try:
+                        source_key = self.source_kms.describe_key(KeyId='alias/rds-migration-source')
+                        source_migration_key = source_key['KeyMetadata']['KeyId']
+                        print(f"   ℹ️  Using existing source migration key: {source_migration_key}")
+                    except:
+                        # Create new KMS key in source account for sharing
+                        key_response = self.source_kms.create_key(
+                            Description='KMS key for sharing RDS snapshots across accounts',
+                            KeyUsage='ENCRYPT_DECRYPT',
+                            Origin='AWS_KMS',
+                            MultiRegion=False
+                        )
+                        source_migration_key = key_response['KeyMetadata']['KeyId']
+                        print(f"   ✅ Created source migration key: {source_migration_key}")
+                        
+                        # Create alias
+                        try:
+                            self.source_kms.create_alias(
+                                AliasName='alias/rds-migration-source',
+                                TargetKeyId=source_migration_key
+                            )
+                            print(f"   ✅ Created alias: alias/rds-migration-source")
+                        except Exception as e:
+                            print(f"   ⚠️  Could not create alias: {str(e)}")
+                        
+                        # Update key policy to allow target account access
+                        try:
+                            policy = {
+                                "Version": "2012-10-17",
+                                "Statement": [
+                                    {
+                                        "Sid": "Enable IAM User Permissions",
+                                        "Effect": "Allow",
+                                        "Principal": {
+                                            "AWS": f"arn:aws:iam::{self.source_account_id}:root"
+                                        },
+                                        "Action": "kms:*",
+                                        "Resource": "*"
+                                    },
+                                    {
+                                        "Sid": "Allow Target Account",
+                                        "Effect": "Allow",
+                                        "Principal": {
+                                            "AWS": f"arn:aws:iam::{self.target_account_id}:root"
+                                        },
+                                        "Action": [
+                                            "kms:Decrypt",
+                                            "kms:DescribeKey",
+                                            "kms:CreateGrant"
+                                        ],
+                                        "Resource": "*"
+                                    }
+                                ]
+                            }
+                            self.source_kms.put_key_policy(
+                                KeyId=source_migration_key,
+                                PolicyName='default',
+                                Policy=json.dumps(policy)
+                            )
+                            print(f"   ✅ Updated key policy to allow target account access")
+                        except Exception as e:
+                            print(f"   ⚠️  Warning: Could not update key policy: {str(e)}")
+                    
+                    # Copy snapshot with new key
+                    print(f"   Copying snapshot with customer-managed key...")
+                    self.source_rds.copy_db_snapshot(
+                        SourceDBSnapshotIdentifier=snapshot_id,
+                        TargetDBSnapshotIdentifier=source_share_snapshot_id,
+                        KmsKeyId=source_migration_key
+                    )
+                    
+                    print(f"   ⏳ Waiting for snapshot copy to complete...")
+                    waiter = self.source_rds.get_waiter('db_snapshot_completed')
+                    waiter.wait(DBSnapshotIdentifier=source_share_snapshot_id)
+                    
+                    print(f"   ✅ Snapshot re-encrypted: {source_share_snapshot_id}")
+                    
+                    # Use the re-encrypted snapshot for sharing
+                    snapshot_id = source_share_snapshot_id
+                    
+                except Exception as e:
+                    print(f"   ❌ Error re-encrypting snapshot: {str(e)}")
+                    return
         
         # Step 4: Share snapshot with target account
         print(f"\n🔗 Step 4: Sharing snapshot with target account...")
@@ -1437,9 +1948,11 @@ class AWSMigrationOrchestrator:
                     
                     copy_params = {
                         'SourceDBSnapshotIdentifier': source_snapshot_arn,
-                        'TargetDBSnapshotIdentifier': target_snapshot_id,
-                        'CopyTags': True
+                        'TargetDBSnapshotIdentifier': target_snapshot_id
                     }
+                    
+                    # Don't copy tags for shared snapshots - AWS doesn't allow it
+                    # Tags will be applied separately after restore if needed
                     
                     if target_kms_key:
                         copy_params['KmsKeyId'] = target_kms_key
@@ -1545,13 +2058,13 @@ class AWSMigrationOrchestrator:
             print(f"   6. Keep source database running as backup initially")
         print("=" * 100)
     
-    def migrate_vpc(self, source_vpc_id: str, target_cidr_block: str = None, dry_run: bool = True):
+    def migrate_vpc(self, source_vpc_id: str, target_vpc_id: str = None, dry_run: bool = True):
         """
-        Migrate VPC and all its components to target account
+        Migrate VPC components to an existing target VPC
         
         Args:
-            source_vpc_id: Source VPC ID to migrate
-            target_cidr_block: Optional custom CIDR block for target VPC (default: use source CIDR)
+            source_vpc_id: Source VPC ID to migrate from
+            target_vpc_id: Target VPC ID to migrate to (required for actual migration)
             dry_run: If True, show what would be done without making changes
         """
         print("\n" + "=" * 100)
@@ -1569,7 +2082,7 @@ class AWSMigrationOrchestrator:
                 raise ValueError(f"VPC {source_vpc_id} not found")
             
             source_vpc = vpc_response['Vpcs'][0]
-            vpc_cidr = target_cidr_block or source_vpc['CidrBlock']
+            source_cidr = source_vpc['CidrBlock']
             
             # Get VPC attributes
             dns_support = self.source_ec2.describe_vpc_attribute(
@@ -1582,11 +2095,29 @@ class AWSMigrationOrchestrator:
             
             vpc_name = next((tag['Value'] for tag in source_vpc.get('Tags', []) if tag['Key'] == 'Name'), 'UnnamedVPC')
             
-            print(f"   ✅ VPC found: {vpc_name}")
-            print(f"   CIDR: {source_vpc['CidrBlock']}")
-            print(f"   Target CIDR: {vpc_cidr}")
+            print(f"   ✅ Source VPC found: {vpc_name}")
+            print(f"   CIDR: {source_cidr}")
             print(f"   DNS Support: {dns_support}")
             print(f"   DNS Hostnames: {dns_hostnames}")
+            
+            # Verify target VPC if not dry-run
+            if not dry_run:
+                if not target_vpc_id:
+                    raise ValueError("Target VPC ID is required for actual migration. Use --target-vpc parameter.")
+                
+                target_vpc_response = self.target_ec2.describe_vpcs(VpcIds=[target_vpc_id])
+                if not target_vpc_response['Vpcs']:
+                    raise ValueError(f"Target VPC {target_vpc_id} not found in target account")
+                
+                target_vpc = target_vpc_response['Vpcs'][0]
+                target_cidr = target_vpc['CidrBlock']
+                target_vpc_name = next((tag['Value'] for tag in target_vpc.get('Tags', []) if tag['Key'] == 'Name'), 'UnnamedVPC')
+                
+                print(f"\n   ✅ Target VPC found: {target_vpc_name}")
+                print(f"   Target VPC ID: {target_vpc_id}")
+                print(f"   Target CIDR: {target_cidr}")
+                print(f"   ℹ️  Will migrate components to existing VPC")
+                
         except Exception as e:
             print(f"   ❌ Error: {str(e)}")
             return
@@ -1731,7 +2262,7 @@ class AWSMigrationOrchestrator:
             print("=" * 100)
             
             print("\n1️⃣  CREATE VPC:")
-            print(f"   - CIDR: {vpc_cidr}")
+            print(f"   - CIDR: {source_cidr}")
             print(f"   - DNS Support: {dns_support}")
             print(f"   - DNS Hostnames: {dns_hostnames}")
             print(f"   - Tags: Name={vpc_name}")
@@ -1782,6 +2313,7 @@ class AWSMigrationOrchestrator:
             
             print("\n⏱️  ESTIMATED TIME: 10-15 minutes")
             print("\n⚠️  IMPORTANT NOTES:")
+            print("   - Requires existing VPC in target account (use --target-vpc parameter)")
             print("   - VPC Peering connections will NOT be migrated (requires manual setup)")
             print("   - VPN connections will NOT be migrated (requires manual setup)")
             print("   - Transit Gateway attachments will NOT be migrated (requires manual setup)")
@@ -1789,15 +2321,24 @@ class AWSMigrationOrchestrator:
             print("   - Elastic IPs for NAT Gateways will be new (different IPs)")
             print("   - Update any hardcoded IPs in applications")
             
-            print("\n🚀 To execute the migration, run without --dry-run flag")
+            print("\n🚀 To execute the migration:")
+            print(f"   python aws_migration.py --migrate-vpc {source_vpc_id} --target-vpc vpc-xxx")
             print("=" * 100)
             
         else:
             # Execute actual migration
             print("\n🚀 EXECUTING MIGRATION...")
+            
+            if not target_vpc_id:
+                print("❌ ERROR: --target-vpc is required for VPC migration")
+                print("   The tool no longer creates new VPCs. You must specify an existing target VPC.")
+                print(f"   Example: --migrate-vpc {source_vpc_id} --target-vpc vpc-xxx")
+                return
+            
             migration_result = {
                 'source_vpc_id': source_vpc_id,
-                'target_vpc_id': None,
+                'target_vpc_id': target_vpc_id,
+                'vpc_reused': True,
                 'subnet_mapping': {},
                 'sg_mapping': {},
                 'nat_gateway_mapping': {},
@@ -1805,44 +2346,7 @@ class AWSMigrationOrchestrator:
             }
             
             try:
-                # Check for existing VPC with same CIDR
-                print("\n[Checking for existing VPC...]")
-                existing_vpcs = self.target_ec2.describe_vpcs(
-                    Filters=[{'Name': 'cidr', 'Values': [vpc_cidr]}]
-                )['Vpcs']
-                
-                if existing_vpcs:
-                    target_vpc_id = existing_vpcs[0]['VpcId']
-                    existing_vpc_name = next((tag['Value'] for tag in existing_vpcs[0].get('Tags', []) if tag['Key'] == 'Name'), 'UnnamedVPC')
-                    migration_result['target_vpc_id'] = target_vpc_id
-                    migration_result['vpc_reused'] = True
-                    print(f"   ✅ Found existing VPC with matching CIDR {vpc_cidr}: {target_vpc_id} ({existing_vpc_name})")
-                    print(f"   ℹ️  Reusing existing VPC instead of creating new one")
-                else:
-                    # Create VPC
-                    print(f"   ℹ️  No existing VPC found with CIDR {vpc_cidr}, creating new VPC...")
-                    target_vpc = self.target_ec2.create_vpc(CidrBlock=vpc_cidr)
-                    target_vpc_id = target_vpc['Vpc']['VpcId']
-                    migration_result['target_vpc_id'] = target_vpc_id
-                    migration_result['vpc_reused'] = False
-                    print(f"   ✅ Created VPC: {target_vpc_id}")
-                    
-                    # Tag VPC
-                    self.target_ec2.create_tags(
-                        Resources=[target_vpc_id],
-                        Tags=[{'Key': 'Name', 'Value': f"{vpc_name}-migrated"}] + 
-                             [tag for tag in source_vpc.get('Tags', []) if tag['Key'] != 'Name']
-                    )
-                    
-                    # Enable DNS attributes
-                    if dns_support:
-                        self.target_ec2.modify_vpc_attribute(VpcId=target_vpc_id, EnableDnsSupport={'Value': True})
-                    if dns_hostnames:
-                        self.target_ec2.modify_vpc_attribute(VpcId=target_vpc_id, EnableDnsHostnames={'Value': True})
-                    
-                    # Wait for VPC to be available
-                    print("   ⏳ Waiting for VPC to be available...")
-                    time.sleep(5)
+                print(f"\n[Using existing target VPC: {target_vpc_id}]")
                 
                 # Create or reuse subnets
                 print(f"\n[Processing {len(subnets)} subnets...]")
@@ -2159,11 +2663,11 @@ Examples:
   # Filter by specific EC2 instances
   python aws_migration.py --report --ec2-instances i-abc123,i-def456
 
-  # Migrate entire VPC (dry-run first)
-  python aws_migration.py --migrate-vpc vpc-abc123 --dry-run
+  # Migrate entire VPC (dry-run first) - requires existing target VPC
+  python aws_migration.py --migrate-vpc vpc-abc123 --target-vpc vpc-xyz789 --dry-run
 
-  # Actually migrate VPC with custom CIDR
-  python aws_migration.py --migrate-vpc vpc-abc123 --target-cidr 172.16.0.0/16
+  # Actually migrate VPC components to existing target VPC
+  python aws_migration.py --migrate-vpc vpc-abc123 --target-vpc vpc-xyz789
 
   # Migrate specific EC2 instance (dry-run first)
   python aws_migration.py --migrate-ec2 i-abc123 --target-vpc vpc-xxx --target-subnet subnet-xxx --dry-run
@@ -2216,12 +2720,12 @@ Examples:
                        help='Target subnet ID for EC2 migration')
     parser.add_argument('--target-security-groups', type=str,
                        help='Comma-separated target security group IDs')
+    parser.add_argument('--target-key-pair', type=str,
+                       help='Target key pair name (if different from source)')
     parser.add_argument('--target-subnet-group', type=str,
                        help='Target DB subnet group name for RDS migration')
     parser.add_argument('--target-kms-key', type=str,
                        help='Target KMS key ID for re-encryption (optional)')
-    parser.add_argument('--target-cidr', type=str,
-                       help='Target CIDR block for VPC migration (optional, uses source CIDR if not specified)')
     
     args = parser.parse_args()
     
@@ -2231,12 +2735,13 @@ Examples:
     target_security_groups = args.target_security_groups.split(',') if args.target_security_groups else []
     
     try:
-        # Initialize orchestrator
+        # Initialize orchestrator with state file in /output for persistence
         orchestrator = AWSMigrationOrchestrator(
             args.source_profile,
             args.target_profile,
             args.source_region,
-            args.target_region
+            args.target_region,
+            state_file="/output/migration_state.json"
         )
         
         if args.setup_policies:
@@ -2276,6 +2781,7 @@ Examples:
                 target_vpc_id=args.target_vpc,
                 target_subnet_id=args.target_subnet,
                 target_security_groups=target_security_groups,
+                target_key_pair=args.target_key_pair,
                 dry_run=args.dry_run
             )
             
@@ -2294,10 +2800,10 @@ Examples:
             )
         
         elif args.migrate_vpc:
-            # Migrate entire VPC
+            # Migrate VPC components to existing target VPC
             orchestrator.migrate_vpc(
                 source_vpc_id=args.migrate_vpc,
-                target_cidr_block=args.target_cidr,
+                target_vpc_id=args.target_vpc,
                 dry_run=args.dry_run
             )
             

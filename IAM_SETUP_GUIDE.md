@@ -123,7 +123,7 @@ aws iam attach-user-policy \
   --profile target_acc
 
 # Create access keys
-aws iam create-access-key --user-name aws-migration-target --profile target_acc
+aws iam create-access-key --user-name aws-migration-taclearrget --profile target_acc
 ```
 
 Then update your `~/.aws/credentials` with the new access keys.
